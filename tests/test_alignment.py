@@ -44,6 +44,19 @@ TEXT = DATA / "raw" / "quran-uthmani.txt"
 JSON = DATA / "raw" / "tajweed.hafs.uthmani-pause-sajdah.json"
 AUDIO_MAP = DATA / "processed" / "audio_map.json"
 
+# audio_map.json est un artefact GENERE par `python -m tajweed.audio_mapper`
+# (8 Mo, non versionne). Les deux tests qui en dependent sont ignores quand il
+# est absent -- typiquement en CI -- plutot que de faire echouer la suite.
+try:
+    import pytest as _pytest
+    requires_audio_map = _pytest.mark.skipif(
+        not AUDIO_MAP.exists(),
+        reason="requires Data/processed/audio_map.json (generated locally, not committed)",
+    )
+except ImportError:  # runner integre, sans pytest
+    def requires_audio_map(fn):
+        return fn
+
 # Chargé une fois (réutilisé par tous les tests).
 VERSES = load_verses(TEXT)
 
@@ -179,6 +192,7 @@ def test_segment_counts_match_raw_per_rule_surah1():
         assert got == raw.get(rule, 0), f"{rule}: extracteur={got} brut={raw.get(rule, 0)}"
 
 
+@requires_audio_map
 def test_full_pipeline_mock_loader_surah1_multi_reciter():
     """Bout-en-bout sans DB : extraction -> audio -> loader (client factice)."""
     amap = load_audio_map(AUDIO_MAP)
@@ -202,6 +216,7 @@ def test_full_pipeline_mock_loader_surah1_multi_reciter():
     assert seg_calls and all(c[2] == "surah,ayah,rule,start_idx,end_idx" for c in seg_calls)
 
 
+@requires_audio_map
 def test_seed_audio_dedup_shared_with_load():
     """seed_audio_from_map puis load ne doivent pas re-pousser les mêmes audios."""
     amap = load_audio_map(AUDIO_MAP)
