@@ -56,20 +56,17 @@ CHOICES = [f"{SURAH_NAMES[s]} {s}:{a}" for s, a in DEMO_AYAHS]
 _gt = LocalGroundTruth(DATA / "raw" / "quran-uthmani.txt",
                        DATA / "raw" / "tajweed.hafs.uthmani-pause-sajdah.json")
 _cal = json.loads((DATA / "processed" / "tajweed_calibration.json").read_text(encoding="utf-8"))
-_aligner = None
+# The ~1.2 GB model is loaded HERE, at import time, on purpose.
+#
+# This Space runs on ZeroGPU, which forks a fresh worker for every @spaces.GPU
+# call. Anything loaded lazily *inside* that call is re-loaded on every single
+# request and blows the GPU time budget — which is exactly how the first
+# deployment failed. Loading at module scope means the weights live in the
+# parent process and every forked worker inherits them.
+_aligner = Wav2Vec2Aligner(model_id=MODEL_ID, device="cpu")
 
 
 def _get_aligner():
-    """Weights load once into the main process; the GPU move happens per call.
-
-    This Space runs on ZeroGPU, where CUDA only exists inside a @spaces.GPU
-    function. Loading the ~1.2 GB model on every request would dominate the
-    latency, so it is loaded on CPU at first use and only *moved* to the GPU
-    inside the decorated call.
-    """
-    global _aligner
-    if _aligner is None:
-        _aligner = Wav2Vec2Aligner(model_id=MODEL_ID, device="cpu")
     return _aligner
 
 
