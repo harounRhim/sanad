@@ -3,6 +3,9 @@
 Arabic speech AI that listens to a recitation and tells the learner **which rule
 they got wrong and by how much** — not just a score.
 
+**▶ [Try it](https://huggingface.co/spaces/kafteji/sanad)** — record an āyah and get
+the measured report back.
+
 > **Scope.** Sanad is an assistive practice tool. It does not replace a qualified
 > teacher and is not an authority on tajwīd. Its thresholds are derived from
 > measured recitation, not from a scholarly ruling. See [Limitations](#limitations).
