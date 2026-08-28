@@ -192,8 +192,11 @@ class Wav2Vec2Aligner:
         toks, idx = text_to_tokens(text)
         tok2id = tok.get_vocab()
         unk = tok2id.get(tok.unk_token, blank)
+        # `targets` doit vivre sur le MÊME device que l'émission : le noyau CUDA
+        # de forced_align refuse un mélange CPU/GPU ("targets must be a CUDA
+        # tensor"). Sans ce .to(), le moteur ne tourne que sur CPU.
         targets = torch.tensor([[tok2id.get(t, unk) for t in toks]],
-                               dtype=torch.int32)
+                               dtype=torch.int32, device=decoded.emission.device)
 
         aligned, _scores = forced_align(decoded.emission.unsqueeze(0), targets, blank=blank)
         aligned = aligned[0].tolist()

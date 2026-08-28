@@ -8,7 +8,7 @@ sdk_version: 6.26.0
 app_file: app.py
 pinned: false
 license: mit
-short_description: Measures tajweed rules in Qur'anic recitation - duration and nasality
+short_description: Tajweed correction for Qur'anic recitation
 ---
 
 # Sanad

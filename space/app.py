@@ -20,11 +20,14 @@ import sys
 from pathlib import Path
 
 import gradio as gr
+import spaces
+import torch
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from tajweed.correction.evaluate import evaluate, _make_aligner   # noqa: E402
+from tajweed.correction.aligner import Wav2Vec2Aligner            # noqa: E402
+from tajweed.correction.evaluate import evaluate                  # noqa: E402
 from tajweed.correction.ground_truth import LocalGroundTruth      # noqa: E402
 
 MODEL_ID = os.environ.get("SANAD_MODEL", "jonatasgrosman/wav2vec2-large-xlsr-53-arabic")
@@ -57,11 +60,25 @@ _aligner = None
 
 
 def _get_aligner():
-    """Loaded once, on first request — keeps Space startup fast."""
+    """Weights load once into the main process; the GPU move happens per call.
+
+    This Space runs on ZeroGPU, where CUDA only exists inside a @spaces.GPU
+    function. Loading the ~1.2 GB model on every request would dominate the
+    latency, so it is loaded on CPU at first use and only *moved* to the GPU
+    inside the decorated call.
+    """
     global _aligner
     if _aligner is None:
-        _aligner = _make_aligner("wav2vec2", MODEL_ID)
+        _aligner = Wav2Vec2Aligner(model_id=MODEL_ID, device="cpu")
     return _aligner
+
+
+def _to_device(aligner, device):
+    model = getattr(aligner, "_model", None)
+    if model is not None:
+        aligner._model = model.to(device)
+    aligner.device = device
+    return aligner
 
 
 COLOR = {"green": "#1f7a4d", "yellow": "#9a6b00", "red": "#a32020"}
@@ -83,12 +100,26 @@ def _render_verse(word_scores, plain_text):
             "font-family:serif'>" + " ".join(parts) + "</div>")
 
 
+@spaces.GPU(duration=120)
+def _run_engine(audio_path, s, a):
+    aligner = _get_aligner()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _to_device(aligner, device)
+    try:
+        return evaluate(Path(audio_path), s, a, aligner, _gt, calibration=_cal).to_dict()
+    finally:
+        # Release the GPU copy so the next call starts from a clean CPU model.
+        if device == "cuda":
+            _to_device(aligner, "cpu")
+            torch.cuda.empty_cache()
+
+
 def grade(audio_path, choice):
     if not audio_path:
         return "### Record or upload a recitation first.", "", None
 
     s, a = DEMO_AYAHS[CHOICES.index(choice)]
-    rep = evaluate(Path(audio_path), s, a, _get_aligner(), _gt, calibration=_cal).to_dict()
+    rep = _run_engine(audio_path, s, a)
 
     text = _gt.get(s, a).text
     cer = rep.get("content_cer")
