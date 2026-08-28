@@ -79,6 +79,9 @@ Two findings worth reading:
 
 Raw calibration: [`Data/processed/tajweed_calibration.json`](Data/processed/tajweed_calibration.json).
 
+A record of the defects found in this system and what was done about them is
+kept in [`docs/ENGINEERING_LOG.md`](docs/ENGINEERING_LOG.md).
+
 ## Limitations
 
 - **Calibrated on a single reciter, 48 āyāt, sūrahs 105–114.** Not validated
