@@ -1,0 +1,7 @@
+gradio>=4.44
+torch>=2.1
+torchaudio>=2.1
+transformers>=4.40
+soundfile>=0.12
+numpy>=1.24
+ijson>=3.2
