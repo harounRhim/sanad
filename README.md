@@ -131,12 +131,16 @@ environment variable — copy `.env.example.txt` to `.env` and
 The `service_role` Supabase key is server-side only; the browser gets the
 publishable key and reads through row-level security policies.
 
-## Data sources
+## Licence and data sources
 
-Qur'anic text (Uthmani), tajwīd rule annotations and reciter audio come from
-third-party sources, each under its own terms. No audio or corpus data is
-committed to this repository — only the code that processes it, and the
-calibration results it produces.
+The code is **AGPL-3.0** — see [LICENSE](LICENSE). Running a modified version as
+a network service means publishing those modifications. If you need it under
+other terms, ask me.
+
+The licence covers the code only. The Qur'anic text is Tanzil.net's under
+CC BY 3.0 and must not be altered; the tajwīd annotations and the reciter audio
+carry their own terms. All of it is set out in
+[DATA_SOURCES.md](DATA_SOURCES.md), including the two items still to verify.
 
 ---
 
