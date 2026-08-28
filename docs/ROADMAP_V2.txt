@@ -1,0 +1,2681 @@
+SANAD — ROADMAP V2 ("real correction" + training + memorization)
+Written 2026-07-06. This is a living coaching doc — re-read it at the start of
+each session, update statuses as milestones land, don't rewrite history.
+
+===============================================================================
+WHY THIS DOC EXISTS
+===============================================================================
+Today we found the v1 correction engine (wav2vec2 forced-alignment, grades
+Madd/Ghunnah DURATION only) will happily grade English or French speech as if
+it were correct Qur'an recitation — because forced alignment never checks
+WHAT was said, only stretches the known-correct text over whatever audio it's
+given and measures timing. That's a trust-breaking gap for a "coach" app.
+
+The user's ask, reorganized into a buildable sequence:
+  1. Verify the person actually said the right letters/words (not just timing).
+  2. Per-word red/yellow/green feedback, shown after they finish an ayah/surah.
+  3. A "why" explanation per mistake (which tajweed rule, what went wrong).
+  4. A Duolingo-style drills screen to practice individual tajweed rules,
+     available any time, with instant correction + encouragement.
+  5. A memorization (hifz) tracker per surah/ayah.
+  6. Spaced repetition (SRS) scheduling built on top of the tracker.
+
+Guiding constraints (explicitly requested): FAST, TRUSTED, LOW-RESOURCE.
+  - Fast: CPU-only, local, no GPU dependency, no multi-second dead air.
+  - Trusted: don't grade "correct" when the content is wrong; show confidence,
+    not false precision. Keep a regression set of known-good/known-bad
+    recordings so every new feature is checked against real evidence, the way
+    Phase 4's sensitivity test (scratchpad/validate_wrong.py) proved the
+    duration gates actually catch injected errors, not just avoid false
+    alarms.
+  - Low-resource: reuse the ALREADY-LOADED wav2vec2 model for new checks
+    instead of adding new heavy models, unless a cheap option is proven
+    insufficient first.
+
+===============================================================================
+PHASE 0 — Content-sanity check (small, do first, unlocks everything else)
+===============================================================================
+Goal: stop grading recitations that don't match the expected text at all.
+
+What: the wav2vec2 model already produces frame-level letter probabilities to
+do forced_align (server/app.py -> tajweed.correction.aligner). Add a plain CTC
+GREEDY DECODE pass over those same logits (near-zero extra cost — same forward
+pass, just a different readout) to get a rough Arabic transcript of what was
+actually said. Compare it to the expected ayah text via normalized edit
+distance (reuse `normalize_arabic` from metadata.py — already strips harakat
+so this is a consonant-skeleton comparison, forgiving of the model's known
+diacritic weaknesses).
+
+Decision rule (tune empirically against real recordings, both correct and
+wrong-language/wrong-ayah):
+  - CER low -> proceed to tajweed grading as today.
+  - CER high -> return a new status "content_mismatch" instead of a graded
+    report ("This doesn't sound like this āyah — check you selected the
+    right one, or try again closer to the mic").
+
+Why this order: it's the cheapest possible fix (no new model, no new infra),
+and it directly closes today's trust gap. Everything below (word-level
+grading, drills, SRS) inherits this check for free once it's built once.
+
+Status: IMPLEMENTED 2026-07-06 (backend). `src/tajweed/correction/content_check.py`
+(char_error_rate + check_content, pure-python Levenshtein, no new deps).
+`Alignment` gained `decoded_text` (types.py); `Wav2Vec2Aligner.align()` now
+also greedy-decodes the SAME logits used for forced_align (aligner.py, zero
+extra forward passes) — `SyntheticAligner` leaves it None (no ML, no check
+possible, content_status stays "unknown" for tests/demo). `evaluate()` in
+evaluate.py computes content_status/content_cer and SHORT-CIRCUITS grading
+(results=[]) on "content_mismatch". `Report`/`to_dict()` carry the 3 new
+fields; server/app.py's /grade needed NO changes (already forwards to_dict()
+verbatim). Tests: tests/test_correction.py +5 (CER identical/foreign/wrong-
+ayah, check_content status, evaluate() short-circuit via a fake mismatched
+aligner) — suite 24/25 (the 1 fail is the pre-existing pytest-only tmp_path
+issue, unrelated). VALIDATED against real reciter audio (see Open Decisions
+below for the full numbers) — works reliably on medium/long ayahs in both
+directions; short ayahs (<~15 letters) are a known, evidence-characterized
+weak spot, deferred to Phase 1's word-level comparison, NOT a threshold bug.
+Frontend DONE too: `app/src/lib/correction.ts` GradeReport gained
+content_status/content_cer/decoded_text; `Practice.tsx` shows a distinct
+amber "This doesn't sound like this āyah" banner (with the decoded text, for
+transparency) INSTEAD of the graded feedback list when content_status is
+"content_mismatch", and skips the per-rule Arabic-text coloring in that case
+(falls back to plain uncolored text). Verified: `npm run typecheck` and
+`npm run build` both clean; end-to-end via curl against the LIVE server
+(both a correct-match and a real induced mismatch returned the right JSON
+shape). PHASE 0 COMPLETE (2026-07-06) — backend + frontend + tests + real-
+audio validation all done. Next up: Phase 1 (word-level scoring).
+
+===============================================================================
+PHASE 1 — Word-level scoring engine (green/yellow/red)
+===============================================================================
+Goal: move grading granularity from "per tajweed-rule segment" (today) to
+"per WORD", combining two independent signals per word:
+  (a) Content correctness — was this word recognized at all (from Phase 0's
+      decode), aligned word-by-word (Levenshtein/DTW over the word sequence,
+      not just a whole-ayah CER).
+  (b) Tajweed correctness — for any rule segments touching that word, reuse
+      the existing measure_segment/rules.py machinery (already built,
+      calibrated, one-sided where appropriate).
+
+Combine into one verdict per word:
+  - RED    = word missing/misrecognized (content problem — most important,
+             a tajweed timing check on a wrong word is meaningless).
+  - YELLOW = word correct, but a tajweed rule on it measured "warn".
+  - GREEN  = word correct AND all tajweed rules on it "ok" (or no rule
+             applies).
+
+This is the architectural core of "an architecture that analyzes just that
+surah and shows where the tajweed mistakes are" — it's the same evaluate()
+pipeline we have, restructured to key its output by word_idx instead of by
+rule, with content-correctness folded in as a first-class signal instead of
+assumed.
+
+Frontend: extend GradedAyah (app/src/screens/Practice.tsx) from
+rule-coloring to word-coloring; each word gets a tap/hover explanation
+("idghaam held 4.2 h, expected 2 — a bit long" or "expected 'الرحمن', not
+recognized"). This is an incremental change to an existing component, not a
+rewrite.
+
+Status: DONE 2026-07-06. `src/tajweed/correction/word_score.py` — `split_words`
+(char-offset word splitting, same offsets as tajweed_segments), `align_words`
+(word-level Levenshtein + backtrace, standard WER-style alignment: matched/
+substituted/deleted per reference word, insertions ignored), `score_words`
+(combines matched-word content with rule_results already computed by
+rules.measure_all → per-word WordScore with verdict green/yellow/red).
+`Report` gained `word_scores` (types.py, avoids circular import via
+`from __future__ import annotations` + duck-typed `to_dict()`); `evaluate()`
+computes it right after `measure_all()`. Tests +8 (split/align/score, incl.
+harakat-insensitivity and insertion-robustness) — suite 34/35 (same pre-
+existing pytest-only failure). Frontend: `correction.ts` gained
+WordScore/WordRule types; `Practice.tsx`'s `GradedAyah` now colors by WORD
+verdict (green/yellow/red) instead of by rule segment, with a per-word hover
+tooltip; legend updated to 🟢/🟠/🔴; removed now-dead `daySegments`/
+`useSegments` (was only feeding the old legend condition). `npm run
+typecheck` + `npm run build` both clean.
+
+TWO REAL BUGS FOUND + FIXED while validating against real reciter audio
+(same discipline as Phase 0 — test on real data, not just synthetic):
+  1. **Basmala prefix (real, pre-existing gotcha, same one Phase 4's
+     audio_verify.py already handles for DURATION).** quran-uthmani.txt
+     prefixes the basmala to the TEXT of ayah 1 of every surah except 1
+     (where the basmala IS the ayah) and 9 (no basmala) — but reciter AUDIO
+     of ayah 1 usually omits it. Before the fix, this made the 4 basmala
+     words show "red" (wrong) on an otherwise-PERFECT 112:1 recitation.
+     Fixed: `_strip_basmala_prefix()` in word_score.py excludes those 4
+     words from scoring entirely (mirrors audio_verify.BASMALA_NORM's
+     letter-count stripping, duplicated locally rather than imported to
+     avoid pulling audio_verify's mutagen dependency into the correction
+     package). Verified on real 112:1 audio: all 4 real words now green.
+  2. **CONFIRMED the Phase-0 short-ayah gap is real AND that Phase 1 fixes
+     it**, exactly as hoped in Phase 0's Open Decisions note: fed 1:1 audio
+     (Basmala) against 112:1's expected text — Phase 0's whole-text CER
+     (0.43) stayed under the 0.75 threshold ("ok", missed it), but Phase 1's
+     word-level scoring correctly marks ALL 4 words "red" (none of 112:1's
+     words appear in the Basmala's decode). This is real, validated evidence
+     that word-level granularity is a genuine improvement, not just a nicer
+     UI — keep this as the reference case if the approach is ever revisited.
+
+KNOWN REMAINING LIMITATION (documented, not fixed — low risk to "fix"):
+  the LAST word of an ayah can show a false "red" because the raw (non-Quran-
+  tuned) CTC greedy decode sometimes truncates a long held madd at the very
+  end of the utterance (observed: 1:1 real audio decoded "...الرَّحِ" instead
+  of "...الرَّحِيمِ", even though content_status was "ok" overall, cer=0.11).
+  Considered a "fuzzy prefix match" fix (treat a hyp word as matching a ref
+  word if it's a real prefix covering most of its length) and REJECTED it:
+  Quranic Arabic has many real minimal-pair-style words sharing long prefixes
+  but differing in ENDING (e.g. الرحمن vs الرحيم both start "الرح") — exactly
+  the kind of word-ending mistake that matters most for tajweed. A fuzzy
+  prefix match would systematically HIDE real ending mistakes to paper over
+  an ASR truncation artifact — worse trade than an occasional false red on
+  the ayah's last word. Leave exact matching; revisit only with a smarter
+  signal (e.g. per-frame decode confidence) if this becomes a UX complaint.
+
+===============================================================================
+PHASE 2 — Whole-surah flow (record once, grade at the end)
+===============================================================================
+Goal: let the user recite a FULL surah in one take (or ayah-by-ayah, app
+concatenates), get ONE combined report when they stop, with the entire surah
+text rendered and word-colored (extends Phase 1's per-word coloring across
+every ayah, not just one).
+
+Two sub-approaches, pick based on how Phase 0/1 perform in practice:
+  A) Batch-after-stop: user records the whole surah, app slices audio by
+     ayah boundaries (silence-gap detection or just accepts one file per
+     ayah recorded in sequence) and calls /grade per ayah, aggregating. Uses
+     server/batch.py's aggregation logic, which ALREADY exists and is tested
+     — mostly a frontend orchestration + UI job, not new ML.
+  B) Streaming-per-ayah: grade each ayah as soon as the user finishes it
+     (e.g. on a pause/tap "next ayah"), so feedback appears progressively
+     instead of one big wait at the end — better "fast" feel for long surahs.
+     Recommended over (A) for surahs beyond a few ayahs.
+
+Status: DONE 2026-07-06, but note the SCOPE CHANGED on direct user request —
+built PAGE-granularity (option B, streaming-per-ayah) instead of whole-surah:
+the user asked mid-session for "page not ayah by ayah, and with every ayah it
+corrects" (i.e. option B was right, but keyed off the muṣḥaf `pages` table —
+already built in the ETL — instead of surah boundaries). Implementation:
+`useQueries.ts` gained `usePageVerses(page)` — a page can span 2+ surahs
+(short surahs near the end), so it's an OR of three Supabase range filters
+(tail of start surah / any surah strictly between / head of end surah),
+collapsed to one range when start===end. `Practice.tsx` rewritten: page
+number input + prev/next instead of surah/ayah dropdowns; a tappable
+progress-dot strip (one per āyah on the page, colored by pass/needs-work/
+pending, current one highlighted) letting the user jump to any āyah;
+`ayahPassed(rep)` = content recognized AND no word verdict is "red" (tajweed
+"yellow" warnings do NOT block advancing — they're feedback, not a gate);
+on pass, a 1.4s-delayed auto-advance moves to the next āyah on the page, or
+rolls onto the NEXT PAGE automatically if it was the page's last āyah.
+Manual jump/page-change clears any pending auto-advance timer. VALIDATED
+live (temporary preview instance, user's own dev server left untouched):
+page 1 correctly shows all 7 Fātiḥa āyahs; jumping to 1:5 via a progress dot
+works; page 106 (a REAL cross-surah page, 4:176→5:1→5:2, queried live from
+Supabase) renders all 3 āyahs in correct order — confirms the multi-surah
+range query. `npm run typecheck`/`build` clean.
+
+**SUPERSEDED same day by continuous single-take recitation (2026-07-06):**
+the button-per-āyah flow above was immediately replaced — user asked to
+recite the WHOLE page in one continuous take with no button-pressing, the
+app auto-detecting āyah boundaries and "interrupting" (like a human muqriʾ)
+only on a mistake, letting the reciter re-do just that āyah and carry on.
+Built:
+  - `app/src/lib/pauseDetector.ts` — pure, framework-free state machine
+    (`stepPauseDetector`) deciding from a stream of RMS samples when a
+    silence gap counts as an āyah boundary: never cuts before any speech in
+    the segment (ignores a leading breath), never cuts shorter than
+    `minSegmentMs`=1200ms even if paused (guards a stray cough), cuts once
+    `pauseMs`=700ms of continuous silence follows real speech. Verified with
+    a standalone node script (no JS test framework in this repo) against 4
+    synthetic RMS traces: leading-silence-only (no cut), real pause (cuts at
+    the right time), short breath (no cut), pause-but-segment-too-short (no
+    cut) — all behave as designed. Defaults (`speechRms`=0.02, `pauseMs`=700,
+    `minSegmentMs`=1200) are REASONABLE STARTING POINTS, NOT validated
+    against real microphone/recitation audio (no way to record real speech
+    in this automated environment) — expect to retune against real usage,
+    especially `pauseMs` (waqf pauses vary a lot by reciting style/speed).
+  - `app/src/hooks/useAutoRecorder.ts` — ONE `getUserMedia` stream for the
+    whole session (mic permission granted once). Key trick avoiding manual
+    PCM slicing: MediaRecorder's chunked webm/opus output can't be sliced at
+    an arbitrary timestamp (only the FIRST chunk carries the container
+    header, so a later subset alone won't decode) — so each detected
+    boundary instead STOPS the current MediaRecorder (yielding one complete,
+    independently-valid blob via the existing `blobToWav16kMono` pipeline,
+    unchanged) and IMMEDIATELY starts a new one on the SAME stream. No gap
+    the user would notice, no second permission prompt. An AnalyserNode +
+    requestAnimationFrame loop feeds live RMS into the pause detector and
+    also drives a UI volume meter. `onSegment` callback is stored in a ref
+    reassigned on EVERY render (not inside an effect) so the async
+    `MediaRecorder.onstop` handler — which can fire well after the render
+    that queued it — always calls the current callback closure; this is
+    what lets Practice.tsx's `handleSegment` reference the live `verse`/`idx`
+    directly with no extra ref-plumbing needed on the caller's side.
+  - `Practice.tsx` rewritten again: manual Record/Stop button removed
+    entirely; single "🎙 Start reciting this page" / "Stop listening" toggle
+    + live volume bar. `handleSegment(blob)` grades the segment against the
+    CURRENT `verse` — pass (content ok, no red word) advances after the
+    existing 1.4s delay same as before; fail leaves the reciter on the same
+    āyah with an inline "🔁 Not quite — recite this āyah again, still
+    listening" prompt, and does nothing else because the recorder is
+    ALREADY listening again by the time grading finishes. Deleted the now-
+    dead `useRecorder.ts` (fully superseded, no other callers).
+  - Validated: pause-detector logic via the node script above;
+    `npm run typecheck`/`build` clean; live smoke test confirmed the page
+    loads, the Start button appears, and the mic-denied error path (expected
+    in this headless environment — no physical mic) degrades gracefully with
+    the same message style as the old recorder, no crash, retry available.
+  - **NOT YET VALIDATED: real acoustic behavior with an actual reciting
+    voice** (silence-threshold tuning, whether 700ms cuts too eagerly/too
+    late between real āyahs, whether background noise trips `speechRms`).
+    This NEEDS the user testing with a real microphone — flag this clearly
+    if they report the auto-cutting feels off, and be ready to retune
+    `DEFAULT_PAUSE_CONFIG` in pauseDetector.ts based on their report rather
+    than guessing further blind.
+
+Status: DONE (continuous-recitation version). Phase 2's original goal
+(whole-passage flow without re-selecting one āyah at a time) is achieved,
+in a more ambitious form than either sub-approach originally sketched above.
+
+**REFINED same day (2026-07-07): whole-page display + fixed a real pipelining
+race.** User asked for the WHOLE page printed on screen at once (not one
+āyah shown at a time) and for listening to truly never pause while a past
+āyah is being analyzed. The display change was straightforward — Practice.tsx
+now renders every verse on the page as its own row simultaneously, each
+independently colored once ITS OWN grading result arrives (a per-āyah
+`reports: Record<number, GradeReport>` map replaces the old single `report`
+state), with the currently-listening row highlighted and click-to-jump kept.
+
+The SECOND half of the ask exposed a REAL correctness bug, not just a UX
+gap: `idx` (which āyah is "expected next") previously only advanced AFTER
+grading resolved (plus an artificial 1.4s delay) — but recording never
+actually paused during that window (by design, from the original Phase 2
+build), so if the reciter naturally kept going and started āyah N+1 before
+āyah N's grade came back, the SECOND pause-boundary would fire while `idx`
+still pointed at N, and get graded against N's text instead of N+1's. Fixed
+by making `idx` advance the INSTANT a segment is cut (before grading even
+starts) rather than after — the mic was already listening for the next āyah
+regardless, this just makes the grading TARGET match reality. Captures
+`gradedIdx = idx` synchronously at the top of `handleSegment` (before any
+`await`) so each segment is graded against whichever āyah was active WHEN
+IT WAS RECORDED, not whatever `idx` has drifted to by the time grading
+resolves. On a miss, `idx` is rewound back to the missed āyah afterward —
+the muqriʾ-style "stop, redo that one" the user asked for in an earlier
+message — even if the reciter had already moved on; the next segment
+re-grades the (rewound) target. Removed the now-pointless `ADVANCE_DELAY_MS`
+timer entirely (advancing is synchronous with the pause detection itself,
+there's nothing left to delay).
+
+Verified: `npm run typecheck`/`build` clean; live smoke test confirmed all
+7 Fātiḥa āyahs render as separate rows simultaneously, click-to-jump
+highlights exactly one row at a time, and (on page 106, the same real
+cross-surah page used for earlier verification) each row's surah-name label
+appears only on the first row and again exactly when the surah changes
+(4:176 → "An-Nisaa", 5:1 → "Al-Maaida", 5:2 → no label) — confirms the verse
+list and per-row rendering are correct. **NOT independently re-verified
+end-to-end with a real overlapping recitation** (would need a real
+microphone reciting quickly enough to overlap with network grading latency)
+— the fix itself is a standard, already-proven-elsewhere React pattern
+(closures + a ref reassigned every render), reasoned through carefully, but
+flag it as one to watch if the user reports a segment still being graded
+against the wrong āyah in fast recitation.
+
+**REFINED AGAIN same day (2026-07-07): unit changed from PAGE to SŪRAH.**
+User pointed out a mushaf PAGE is an arbitrary print boundary, not a sūrah
+boundary — reciting "the whole page" visually breaks a sūrah into unrelated
+chunks and doesn't match "recite the full sūrah in one sitting." Recording
+itself never stopped across a page rollover (already true from the original
+Phase 2 build), but the DISPLAY did reset to a new, unrelated page, breaking
+the visual continuity of reciting one sūrah start-to-finish.
+
+Swapped the whole navigation unit: `usePages`/`usePageVerses` (mushaf page
+range, can span 2+ sūrahs) replaced by the already-existing `useVerses(surah)`
+hook (one sūrah, always exactly one sūrah — no cross-boundary query needed
+at all here, simpler than the page case). URL param `?page=N` (1-604) became
+`?surah=N` (1-114); the number-input+prev/next page picker became a
+`<select>` of all 114 sūrah names (nicer than a bare number for this unit —
+sūrah names matter more than page numbers) + prev/next buttons, with a
+sūrah-info line (āyah count + Arabic name) underneath. Finishing the last
+āyah of a sūrah successfully now rolls onto sūrah+1 (bounded at 114) instead
+of page+1. Since every row now shares the same sūrah, the earlier "show
+sūrah name only at the first row / when it changes" per-row logic was
+removed (dead weight once there's only ever one sūrah on screen) in favor of
+one sūrah-name/count header shown once, same pattern the Drills screen
+already uses for rule info.
+
+`app/src/hooks/useQueries.ts`'s `usePages`/`usePageVerses` are NOT deleted —
+still used elsewhere (mushaf page-mode Reader screen, if/when built; Pages
+index). Only Practice.tsx's IMPORT of them was swapped for `useVerses`.
+
+Verified: `npm run typecheck`/`build` clean; live smoke test on Al-Baqara
+(sūrah 2, 286 āyahs — deliberately the LONGEST sūrah, to stress-test
+"render an entire sūrah's rows at once") confirmed all 286 rows render with
+no console errors, correct header ("286 āyahs" + "البقرة"), correct dropdown
+selection, and the known basmala-prefix-in-text quirk showing correctly on
+2:1. No virtualization was added for long sūrahs — deliberately: a few
+hundred simple text rows is well within what a modern browser renders fine,
+and virtualizing would conflict with "the whole sūrah is visible at once,"
+the actual point of this change; only reconsider if a real device genuinely
+struggles (not verified on low-end hardware, only in this preview browser).
+
+===============================================================================
+MAJOR REARCHITECTURE (2026-07-07): word-by-word WINDOW grading, not ayah-by-ayah
+===============================================================================
+User found a REAL bug in the continuous-recitation design above: if a whole
+sūrah is recited fluently with little/no pause between āyahs, the silence-
+based segmenter never fires, so ALL the audio piles into ONE segment — which
+was still misattributed to whatever āyah the cursor happened to be on
+(āyah 1, since nothing had advanced it yet). The fundamental flaw: the old
+design ASSUMED "this audio segment IS exactly āyah N" instead of measuring
+how far the recitation actually got. User's fix request: correct word-by-word
+(not ayah-by-ayah), and render the sūrah like an actual Qur'an book (one
+continuous flow), not one boxed row per āyah.
+
+**Backend — sliding window instead of one assumed āyah:**
+  - `ground_truth.py`: new `RangeGroundTruth` + `AyahSpan` types and
+    `get_range(surah, start_ayah, count)` on BOTH LocalGroundTruth and
+    SupabaseGroundTruth — concatenates `count` consecutive āyahs' text into
+    one string (offset-adjusted tajweed segments, per-āyah char spans),
+    truncating gracefully at the sūrah's end. Verified against real data:
+    offsets exactly match text slices; boundary case (asking for 5 āyahs
+    starting at 1:6, only 2 exist) correctly returns just those 2.
+  - `evaluate.py`: new `evaluate_window(audio, surah, start_ayah, aligner,
+    gt_source, count=6, ...)` — aligns the clip against the WHOLE WINDOW's
+    text (not one āyah), runs the existing word_score.score_words() over it
+    (unchanged — it's already ayah-agnostic, just operates on whatever text
+    it's given), then walks the window's āyahs in order computing
+    `confirmed_ayahs` = the consecutive prefix of āyahs "recognized enough".
+  - **CONFIRM_RATIO tuning — validated on real audio, do not set back to
+    "require ALL words":** first attempt required every word in an āyah to
+    be content_ok. Tested on REAL correct continuous audio (alafasy 1:1+1:2+
+    1:3 concatenated, no pause) — confirmed_ayahs came back EMPTY even though
+    the recitation was perfect, because the raw non-Quran-tuned CTC decode
+    has a genuine per-word error rate of ~25-40% even on clean correct audio
+    (e.g. "ٱلْعَٰلَمِينَ" decoded one letter short) — requiring 100% word
+    accuracy per āyah is unrealistic given this baseline noise. Switched to
+    CONFIRM_RATIO=0.5 (majority of words content_ok, inclusive) and
+    re-verified the SAME real audio: confirmed_ayahs correctly came back
+    [1,2,3] (exactly what was recited) and correctly stopped before 4/5/6
+    (not recited in that clip, all red). ALSO verified the negative case —
+    audio of 1:1 followed directly by 1:3 (āyah 2 SKIPPED) — confirmed_ayahs
+    correctly returned [1] only, even though ayah 3's content technically
+    appears later in the clip (the consecutive-prefix rule correctly refuses
+    to "skip ahead" over the gap). Both directions verified — majority
+    threshold is robust, not just permissive.
+  - Only `start_ayah`'s muqattaʿāt/basmala CONTEXT is passed to measure_all
+    for a window (not per-ayah-in-window) — acceptable v1 simplification, a
+    window starting mid-recitation on a muqattaʿāt-opening āyah is rare and
+    the effect is scoped to that one rule's grading.
+  - `types.py`: new `WindowReport` (surah, start_ayah, end_ayah,
+    ayah_spans, confirmed_ayahs, word_scores — each word tagged with its
+    owning āyah number via `_ayah_for()`).
+  - `server/app.py`: new `POST /grade_window` (surah, start_ayah, file) →
+    WindowReport JSON. Window size configurable via `CORRECTION_WINDOW_AYAHS`
+    env var (default 6). Verified live via curl against the real running
+    server — output exactly matches the direct-function-call tests above.
+  - Tests: +3 in tests/test_correction.py (majority-threshold boundary
+    inclusive, genuine-miss still stops the prefix, per-word āyah tagging) —
+    suite 37/38 (same pre-existing pytest-only fixture failure).
+
+**Frontend — always-cutting recorder + cursor-based grading + book display:**
+  - `lib/pauseDetector.ts`: added `maxSegmentMs` (default 8000ms) — forces a
+    cut periodically EVEN WITHOUT silence, so a fluent reciter with no real
+    pauses still gets segmented regularly (this is what feeds evaluate_window
+    a steady stream of clips to measure progress from). Verified via the
+    existing node-script harness: continuous non-stop "speech" force-cuts
+    exactly every 8000ms; pure silence never force-cuts.
+  - `lib/correction.ts`: new `gradeWindow()` client + `WindowReport`/
+    `WindowWordScore` types (word gets a nullable `ayah` tag from the server).
+  - `lib/grading.ts`: extracted `srsQualityForWords(words)` (was inline in
+    `srsQuality`) so Practice.tsx can compute SM-2 quality for an arbitrary
+    subset of words (one confirmed āyah at a time) instead of a whole report.
+  - `components/GradedSurah.tsx` (NEW): renders an ENTIRE sūrah as ONE
+    continuous paragraph (`dir="rtl"`, `text-justify`) — every āyah's words
+    flow inline with the next, separated by a small ornate ayah-end marker
+    (﴿١﴾ style, matching real Qur'an typesetting) instead of a hard line
+    break. This is the "quran book, not every [ayah] in a line" the user
+    asked for. The currently-listened-for āyah gets a soft highlight.
+  - `screens/Practice.tsx` rewritten around a `cursorAyah` (āyah NUMBER, not
+    an array index) instead of `idx`: `handleSegment` grades against a WINDOW
+    starting at `cursorAyah`, merges in word-level results ONLY for the
+    confirmed prefix (or `cursorAyah` alone if nothing confirmed — an āyah
+    further into the window that just wasn't reached yet must NOT be shown
+    red, since red there would mean "not yet recited", not "wrong"), advances
+    `cursorAyah` past the confirmed prefix (rolling to the next sūrah if it
+    runs off the end), and feeds the memorization tracker only for āyahs with
+    real evidence (confirmed ones, or `cursorAyah` itself on a genuine miss —
+    never speculative "not reached yet" āyahs further into the window).
+  - Verified live: whole-sūrah continuous book rendering confirmed (all 7
+    Fātiḥa āyahs in one flowing paragraph with ﴿١﴾…﴿٧﴾ markers); progress-dot
+    click-to-jump correctly retargets `cursorAyah` and highlights exactly one
+    āyah at a time. `npm run typecheck`/`build` clean throughout.
+  - **NOT re-verified end-to-end with a real overlapping/continuous
+    microphone recitation** (same limitation as every prior mic-dependent
+    change this session) — the backend half IS validated against real
+    concatenated audio (see CONFIRM_RATIO section above), but the full
+    browser→mic→useAutoRecorder→gradeWindow→UI loop needs the user's own
+    voice to exercise properly. Flag this specifically if the user reports
+    the cursor still not advancing correctly during fluent continuous
+    recitation — check CONFIRM_RATIO and maxSegmentMs first.
+
+**FOLLOW-UP FIX (2026-07-08): "stuck cursor" cascade, found from real user
+testing.** First real end-to-end mic report: user recited the WHOLE sūrah
+continuously and the app "took it as a single block, doesn't analyse it" —
+diagnosed via a screenshot showing the cursor frozen on āyah 1 the entire
+time, with a content-mismatch banner quoting garbled āyah-7-ish content.
+**Root cause:** if the FIRST segment fails to confirm `start_ayah` (mic
+noise, a rough first attempt, real-world audio being noisier than the studio
+reciter audio this was validated against), the cursor never advances — and
+EVERY subsequent segment (which by then contains genuinely LATER content,
+since the reciter keeps going) still gets compared against a window starting
+at the same un-advanced āyah. That comparison can never succeed either, so
+the failure cascades for the rest of the session: nothing ever confirms
+again, which is exactly "stuck as one block."
+
+**Fix — `resume_ayah` rescue signal:** `evaluate_window` now also scans the
+āyahs AFTER wherever the normal consecutive-prefix match stopped (even if it
+stopped at zero, i.e. `confirmed_ayahs` is empty). If a LATER āyah in the
+window still shows strong evidence (RESCUE_RATIO=0.6, stricter than
+CONFIRM_RATIO=0.5's since we're accepting a gap rather than a clean prefix),
+`resume_ayah` = right after the FURTHEST such āyah. `WindowReport` gained
+`resume_ayah: Optional[int]` (+ to_dict()); `server/app.py` needed no
+changes (already forwards to_dict() verbatim).
+
+Frontend (`Practice.tsx`): `handleSegment` now branches three ways instead
+of two — (1) normal confirmed prefix → advance as before; (2) confirmed
+empty but `resume_ayah` set → mark the gap āyahs (start_ayah through
+resume_ayah-2) with a NEW status `"skipped"` (uncertain — NOT the same as
+"needs_work"/wrong, since there's no negative evidence for them, just
+missing evidence), mark the rescuing āyah itself "pass" with its real word
+scores, feed the memorization tracker for the rescuing āyah, and jump the
+cursor to `resume_ayah`; (3) confirmed empty AND no rescue → genuine miss,
+cursor stays put for a real retry (unchanged from before). New `"skipped"`
+progress-dot color (`#9AA0A6`, distinct medium gray) added alongside the
+existing pass/needs_work/pending/untouched colors.
+
+Also added a temporary **on-screen diagnostic log** ("Activity log (debug)"
+panel, shown while listening) — logs every segment cut (size, target āyah)
+and every grading result (confirmed āyahs, resume target, timing, or error)
+in plain text on the Practice screen itself. This is how the stuck-cursor
+bug got diagnosed at all: the dev sandbox this app is built in has no way to
+exercise a real microphone, so real bug reports from the user's own voice
+are the ONLY way to catch this class of issue — the log lets them report
+back exactly what's happening without needing browser dev tools. Remove
+once continuous recitation is confirmed reliable in real use, or keep as a
+permanent "show details" toggle if it proves generally useful.
+
+Validated: unit tests +2 (rescue fires past a totally-failed start_ayah,
+does NOT fire when nothing in the window matches at all — guards against
+false rescues on pure noise). Real-audio test: replaced āyah 1's audio with
+pure noise, kept āyahs 2+3 as real correct alafasy audio, concatenated —
+`confirmed_ayahs=[]` (āyah 1 correctly never confirms) but
+`resume_ayah=4` (correctly skips past the noisy āyah AND both good ones,
+landing right after the furthest real match) — verified both via direct
+Python call and live through the running `/grade_window` endpoint via curl,
+identical result. Suite 39/40 (same pre-existing pytest-only failure).
+`npm run typecheck`/`build` clean. **STILL not verified with the user's
+actual voice against this specific fix** (server was restarted with the fix
+but the user hadn't retried yet at time of writing) — this directly
+addresses their reported symptom and is validated as far as this sandbox
+allows, but confirm with them on next contact whether the cursor now
+recovers instead of sticking.
+
+**FOLLOW-UP TUNING (2026-07-08, same-day real user feedback): "cursor is not
+passing to the next āyah fast enough."** `maxSegmentMs` lowered from 8000 to
+4000 in `lib/pauseDetector.ts` — at 8s, a fluent reciter with no real pauses
+could only ever get a progress check that often at best, ON TOP OF the
+grading round-trip latency after each cut; shorter forced segments both
+trigger checks twice as often AND process faster individually (CPU alignment
+cost scales with audio length). Verified via the node-script harness: cuts
+now correctly land at 4000/8000/12000/16000ms during continuous speech.
+`npm run typecheck`/`build` clean. Pure config-value change, no logic
+change — should hot-reload for the user via Vite HMR without a restart.
+NOT yet confirmed by the user whether 4s feels responsive enough; if still
+too slow, the next lever is either lowering it further (watch for CPU
+inference time becoming the dominant cost instead of the interval itself)
+or investigating whether the grading round-trip itself can be sped up.
+
+**FOLLOW-UP (2026-07-08, same day): "analyse even half an āyah."** User
+asked directly for this once segments started landing mid-āyah more often
+(after the maxSegmentMs 8000→4000 change above). Previously `Practice.tsx`
+only merged word-level color for a whole āyah once it reached ayah-level
+confirmation (`confirmed_ayahs`) or the rescue path — a segment that only
+captured HALF an āyah showed NOTHING for it until a later segment finished
+the job, hiding real progress in the meantime.
+
+Fix: `handleSegment` now merges word-level evidence immediately, word by
+word, on EVERY grading response — regardless of whole-āyah confirmation
+status. A correctly-recognized word (`content_ok`) is shown right away no
+matter which āyah it belongs to; an unrecognized/wrong word is only shown
+for `startAyah` (the āyah actively being targeted this round) — a red word
+elsewhere in the window more likely means "not recited yet" than "wrong", so
+the rest of the window still isn't painted red on every attempt. New word
+entries are APPENDED (not replacing prior ones) to each āyah's array in
+`wordsByAyah`; `GradedSurah`'s per-character coloring loop naturally lets
+the LATEST entry at a given text position win, so fresher evidence overrides
+stale evidence for the same word without needing explicit dedup logic.
+
+Ayah-level semantics (progress dots, cursor advancement, memorization
+feed) are UNCHANGED — still purely driven by `confirmed_ayahs`/
+`resume_ayah`, whole-āyah granularity. The dots communicate "is this āyah
+DONE"; the inline text coloring now separately communicates "which specific
+words have been verified so far, live" — two signals at different
+granularities, not in conflict. `npm run typecheck`/`build` clean; smoke-
+tested (page loads, no console errors) — the actual half-āyah visual
+progression needs the user's real voice to confirm, same standing
+limitation as every mic-dependent change this session.
+
+===============================================================================
+SECOND MAJOR REARCHITECTURE (2026-07-08): "sūrah = one paragraph", no cursor at all
+===============================================================================
+User's own words: "our method of analysing is not optimal, it's not giving
+the right output — we need to deal with Qur'an like every sūrah is just a
+paragraph, that's why you can analyse it without needing to navigate between
+āyahs." This came right after the window/cursor design above (confirmed_
+ayahs, resume_ayah rescue) — that design was a real improvement but still
+had a CLIENT-TRACKED CURSOR as its foundation, and inherited a whole class of
+"what if the cursor gets out of sync with reality" bugs by construction.
+
+**The redesign: the SERVER locates every clip within the WHOLE sūrah from
+its content — no `ayah`/`start_ayah` parameter at all.** Client just says
+"here's a clip, here's which sūrah" and gets back which āyah(s) it
+corresponds to, graded. No cursor to track, no cursor to get stuck.
+
+Backend, in build order (several dead ends along the way — kept here since
+future work will hit the same tradeoffs):
+
+  1. **Split the aligner into decode()/align_from_decode()** (aligner.py).
+     Locating a clip within a whole sūrah, then grading precisely, needs TWO
+     different text scopes (whole sūrah for locating, one identified āyah
+     range for grading) from the SAME audio — but the model forward pass
+     (expensive) must only run ONCE. `decode()` does the forward pass +
+     greedy CTC decode and returns a `DecodeResult` (cached logits);
+     `align_from_decode()` reuses those cached logits to forced-align against
+     ANY text, repeatably, with no further model calls. `align()` kept as a
+     decode()+align_from_decode() convenience wrapper for backward compat
+     (evaluate()/evaluate_window() unchanged). Verified byte-identical output
+     vs the old single-call align() on real audio.
+
+  2. **Localization attempt #1 — word-level** (word_score.matched_ref_range,
+     since removed). Reused the existing word-level align_words DP against
+     the whole sūrah's word list. FOUND NOT ROBUST: a real, CORRECTLY-recited
+     1:5 clip decoded with SCRAMBLED word boundaries (the CTC "|" delimiter
+     token mispredicted, merging/splitting words wrong) even though the
+     underlying LETTERS were fine — word-level matching found ZERO matches
+     for content that was actually right. Root cause: word-level matching is
+     fundamentally sensitive to the ASR's word-boundary predictions, which
+     aren't reliable enough for this. REMOVED entirely (function + its 3
+     tests) in favor of #3.
+
+  2b. **content_check.locate_best_span — CHARACTER-level instead of word-
+     level.** Reuses char_error_rate's consonant-skeleton comparison
+     (Phase 0, already proven robust to word-boundary noise since it doesn't
+     use words at all). First version: try every consecutive-āyah span (1..6
+     āyahs) starting at every position, score each with full CER, keep the
+     best. CORRECT in every test (including the word-boundary-scrambled 1:5
+     case) but SLOW: measured 41s on a single long āyah (Āyat al-Kursī, ~52s
+     recited) within a long sūrah (Al-Baqara, 286 āyahs) — O(n×max_span) full
+     Levenshtein calls is a lot of duplicated work for a long sūrah.
+
+  3. **Localization attempt #2 — Smith-Waterman local alignment.** ONE
+     O(len(decoded)×len(sūrah)) DP pass instead of many separate
+     comparisons — fast in theory. FOUND TWO NEW PROBLEMS: (a) still ~20s+ in
+     pure Python for a long sūrah (interpreter overhead on a large matrix,
+     no numpy used); (b) a SHORT āyah (2:1, "الم" — Alif-Lām-Mīm, 3 letters)
+     matched a WRONG position elsewhere in Al-Baqara by pure chance — local
+     alignment has no concept of "this match is suspiciously short/weak", so
+     a tiny needle can score decently almost anywhere in a long haystack.
+     REMOVED — replaced by #4.
+
+  4. **Localization attempt #3 (final) — adaptive two-stage, in
+     content_check.py.** Kept #2b's PROVEN correctness, fixed its speed:
+       - SHORT decoded clip (< SHORT_HYP_CHARS=12 normalized chars, e.g. the
+         "الم" case): skip any prefilter, run the exact search over every
+         candidate — cheap regardless of sūrah length when hyp itself is
+         short (this is exactly the case where a cheap prefilter has no
+         signal to offer anyway — a 3-letter query has ~2 bigrams total).
+       - LONG decoded clip: a CHEAP bigram-overlap prefilter (precomputed
+         per-āyah, O(n×max_span) not O(n×max_span²) — an incremental/capped
+         accumulation, not re-normalizing overlapping windows from scratch)
+         ranks all candidates; only the top_k=6 best-looking ones get the
+         EXPENSIVE exact comparison.
+     Verified: real long-āyah case (Āyat al-Kursī, full 52s) dropped from
+     41s → ~20s for a FULL clip (see below for why this doesn't matter in
+     practice) and a REALISTIC ~6s partial clip → 1.5s. Short-āyah case
+     (2:1) correctly locates ayah 1 (was landing on a wrong āyah with both
+     earlier attempts).
+
+  5. **A SEPARATE real bug found along the way — partial-recitation length
+     bias.** A short clip covering only the OPENING of a long āyah (e.g. 6s
+     of Āyat al-Kursī's 52s) was locating a SHORT, WRONG āyah (2:163, shares
+     "لا إله إلا هو" but not "الحي القيم") instead of the correct long one
+     (2:255) — root cause: whole-window CER (`edit_distance/len(ref)`)
+     counts the āyah's entire UNRECITED remainder as "error", so a short
+     clip structurally favors any accidentally similarly-SHORT wrong āyah
+     over the correct long one. Fixed with `_prefix_aware_cer` — compares
+     the clip against a PREFIX of the candidate window sized to the clip's
+     own length (with slack), not the whole window. Had to fix this in BOTH
+     the final CER stage AND the bigram prefilter (capping the prefilter's
+     window length the same way) — fixing only one still let the correct
+     long āyah get filtered out before the final stage ever saw it. Verified
+     on the real Āyat al-Kursī partial clip (now correctly locates 255) and
+     a synthetic unit test (careful this time to use non-overlapping fixture
+     words — an earlier version of the test accidentally shared a word
+     between its two fixture āyahs and gave a false failure).
+
+  6. **evaluate_clip() reuses locate_best_span's score directly** as
+     `content_cer`/`content_status`, instead of re-running check_content() on
+     the whole identified sub-text — that would have reintroduced exactly
+     the partial-recitation bias #5 just fixed. `locate_best_span` now
+     returns `(ayah_from, ayah_to, cer)`, not just the range.
+
+  7. **`LocalGroundTruth` performance fix — unrelated to the above but
+     found because of it.** `get()`/`get_range()` used to call
+     `extractor.iter_segments()` once PER RULE PER ĀYAH (18×N calls), and
+     each call RE-SCANS THE ENTIRE ANNOTATIONS JSON FILE FROM DISK. For a
+     single āyah this was slow-but-tolerable (~18 scans); for `evaluate_clip`
+     fetching a WHOLE sūrah (even just Al-Fātiḥa's 7 āyahs = 126 scans) it
+     was measured at ~15s of pure I/O overhead PER REQUEST — the actual
+     model decode was only ~2s. Fixed with a lazy-built, one-time in-memory
+     index (`_index()`, built via a single streaming pass on first access,
+     cached for the process's lifetime) — dropped to ~0.1-0.3s regardless of
+     how large the requested range is. This is why the "41s" and "20s"
+     numbers above look so bad relative to later measurements — the ground-
+     truth I/O bug was compounding the localization algorithm's own slowness
+     for a while before being isolated and fixed separately.
+
+  8. **New endpoint `POST /grade_clip`** (surah, file) → `ClipReport`
+     (`located`, `ayah_from`, `ayah_to`, `content_status`, `word_scores`
+     tagged per-āyah). `/grade_window` and `/grade` kept functional
+     (unused by the frontend now, but harmless to leave — evaluate()/
+     evaluate_window() are still valid, simpler entry points for anything
+     that DOES already know which āyah it wants).
+
+Frontend — `Practice.tsx` rewritten a third time, this time much SIMPLER
+than either prior version: no `cursorAyah`/`confirmed_ayahs`/`resume_ayah`
+state or branching at all. `handleSegment` just calls `gradeClip(surah,
+wav)` (no āyah argument) and merges whatever word_scores come back, tagged
+by their OWN āyah number, directly into `wordsByAyah` — every returned word
+genuinely belongs to a correctly-IDENTIFIED range, so (unlike the window
+design) there's no need to filter out "not-yet-reached" speculative āyahs
+either. `highlightAyah` replaced `cursorAyah` as a PURELY COSMETIC "which
+āyah to softly highlight" value, set to whatever the latest response
+identified — it is NOT an input to grading anymore, just a display detail.
+Rolls to the next sūrah when the located range reaches the sūrah's last āyah
+with a passing grade. `lib/correction.ts`: added `gradeClip`/`ClipReport`,
+removed `gradeWindow`/`WindowReport` (dead — Practice.tsx was their only
+caller), renamed `WindowWordScore` → `AyahTaggedWordScore` (shared shape,
+name no longer tied to the now-removed window concept; `GradedSurah.tsx`
+updated to match).
+
+Validated: 46/47 Python tests (7 new: locate_best_span × 5 scenarios +
+evaluate_clip × 2, using fresh Fake aligner/ground-truth fixtures mirroring
+the existing test conventions); `npm run typecheck`/`build` clean; live
+`/grade_clip` calls via curl AND via the browser's own fetch (CORS path)
+both match the direct-function-call results exactly; full real-audio sweep
+re-run end-to-end after ALL fixes landed together — 1:5 alone, 1:1 alone,
+1:7 alone, 2:1 (short muqattaʿāt) all locate correctly and fast (1.5-4.5s);
+Āyat al-Kursī located correctly at realistic (~6s) clip length.
+
+**One remaining KNOWN, PRE-EXISTING limitation, not a new bug:** muqattaʿāt
+(disconnected letters, e.g. 2:1 "الم") are pronounced by NAMING each letter
+individually ("Alif... Lām... Mīm"), a speech pattern the generic
+(non-Qur'an-tuned) ASR model was never trained on — it garbles this into an
+unrelated real word ("بالإفلام", "with the films") often enough that
+localization for muqattaʿāt-only content is unreliable (both candidate
+scores end up bad, ~0.6-0.7 CER, neither a confident match). This exactly
+matches Phase 4's already-documented finding (2026-06-30) that muqattaʿāt
+are hard to GRADE with this aligner — now confirmed they're also hard to
+LOCATE, for the same underlying ASR-training-data reason. Not chased further
+this session; flag it if it becomes a recurring real complaint (the 29
+muqattaʿāt-opening sūrahs are a known, bounded set if a targeted fix is ever
+wanted — e.g. a small hand-built mapping of expected letter-name-decoded
+forms, out of scope for now).
+
+**NOT yet confirmed by the user's own voice end-to-end** — same standing
+caveat as every mic-dependent change this session (this dev sandbox has no
+real microphone). Backend is validated as thoroughly as this environment
+allows (real audio, live server, both curl and browser-fetch paths); the
+full mic → useAutoRecorder → gradeClip → UI loop needs the user's actual
+recitation to confirm feels right in practice.
+
+-------------------------------------------------------------------------------
+FOLLOW-UP FIX (2026-07-08, user's FIRST real-mic test): word_score.py still
+used strict word-level matching, reproducing the exact bug locate_best_span
+was already fixed for
+-------------------------------------------------------------------------------
+User shared a screenshot of their first real recitation of Al-Fātiḥa in
+paragraph mode: most of āyahs 3, 5, 6, 7 showed red ("word not recognized")
+despite what looked like a correct recitation. Root cause: `locate_best_span`
+(above) was deliberately rewritten to compare CHARACTERS, not words, because
+the CTC greedy decode's word-delimiter predictions can scramble word
+boundaries even on CORRECT audio — but `word_score.py`'s per-word GRADING
+(`align_words`/`score_words`, which is what actually produces the red/yellow/
+green colors the user sees) was never updated and still required an EXACT
+string match (after `normalize_arabic`) between a decoded word and a
+reference word. A single scrambled boundary or a single ASR-misheard letter
+anywhere in a word was enough to flag that whole word red, and because
+`align_words` is a Levenshtein/backtrace WORD-level DP, one bad match could
+throw off the alignment of everything after it — a cascade, matching exactly
+what the screenshot showed (long runs of red rather than isolated words).
+
+**Fix (word_score.py):** replaced the DP's binary 0/1 substitution cost with
+a continuous per-word CHARACTER-error-rate cost (`_word_sub_cost`, reusing
+`content_check._levenshtein`) — two words are still "the same word" if they're
+close (small ASR letter slip, shifted boundary), but a genuinely different
+word (high CER) still costs close to 1.0, same as before. `WORD_CONTENT_
+MISMATCH_CER = 0.5` gates whether a diagonal (aligned) pair counts as
+`content_ok`. Backtrace changed from re-deriving the path via float `==`
+comparisons to storing explicit back-pointers during the forward DP pass
+(robust against float-equality pitfalls the fuzzy costs would otherwise
+introduce). `score_words`'s interface (and all its callers) unchanged — only
+`align_words`'s internal cost function changed, still returns `List[bool]`.
+
+**Validated on real audio** (script kept at `.build_tmp/probe_word_score_
+fix.py`): ran `evaluate_clip` on husary's real recording of EACH āyah of
+Al-Fātiḥa individually (reproducing the screenshot's scenario — one segment
+per āyah). Before this fix, per-letter ASR noise alone (e.g. āyah 4 decoding
+"مالث يون الدين" for "مَالِكِ يَوْمِ الدِّينِ" — last letter of two words
+misheard) would have flagged those words red under exact matching. After the
+fix: **0 red words on āyahs 1–6, 1 red word on āyah 7 (out of 33 total
+words)** — the single remaining red is a genuine two-word boundary collapse
+("وَلَا" + "الضَّالِّينَ" decoded as one fused token with no space at all),
+a harder case than a simple letter slip and left as an acceptable residual
+rather than over-fit to. Full test suite re-run: 46/47 (same pre-existing
+pytest-only failure, unrelated). Restarted the correction server with the
+fix. Also fixed a related UX bug found while investigating: the Practice
+screen's debug "Activity log" panel was gated on `autoRec.listening`, so it
+vanished the instant Stop was pressed — exactly the state the user's
+screenshot was taken in, meaning the one tool built for diagnosing exactly
+this kind of issue was unusable after the fact. Changed the gate to
+`log.length > 0` so it persists after stopping.
+
+**SUPERSEDED same day, see below** — this per-word fuzzy-CER fix helped but
+turned out not to be the most robust approach; the user's second real-mic
+test showed it wasn't enough (still red on āyahs 4/5/7), which led to a
+deeper rewrite (search "THIRD FIX (2026-07-08, same day)").
+
+-------------------------------------------------------------------------------
+THIRD FIX (2026-07-08, same day): word-level grading rebuilt on GLOBAL
+character alignment — no word-splitting at all, ever
+-------------------------------------------------------------------------------
+User's second screenshot (after the fuzzy-CER fix above) showed real
+improvement (āyahs 1, 2, 3, 6 fully green) but āyahs 4, 5, 7 were still
+mostly red despite what sounded like correct recitation. User's instruction:
+"try different method to make it the most reliable possible without making
+it don't recognize mistakes" — i.e. don't just loosen thresholds further
+(that risks silently accepting real mistakes), find the actually-robust
+approach.
+
+Investigated with a purpose-built probe
+(`.build_tmp/build_continuous_fatiha.py` + `.build_tmp/probe_continuous_
+fatiha.py`, husary's real Al-Fātiḥa audio concatenated into one continuous
+50s clip, decoded as a single pass): the decoded text came back as
+**"بِسْمِ اللَّه الرَّحمَنِ الرَّحيِالْحَمْدُ لِلَّهِ رَبِّ الْعالَمِمِ
+الرَّحْمَنِ الرَّحِيمِمَالِكِ يَومِ الدِّيمِإِيَا كَنَعْبُدُوا..."** — at
+EVERY single āyah boundary, the CTC's word-delimiter "|" token vanished
+entirely, fusing the end of one āyah directly into the start of the next
+with ZERO space ("الرحيم" + "الحمد" → "الرَّحيِالْحَمْدُ"). This is far more
+severe over a long continuous decode than the isolated-word slips the
+previous fix targeted — the fuzzy per-WORD DP still needs `decoded_text.
+split()` to produce roughly-word-shaped tokens to match against, and a
+2-word fusion produces one token that doesn't resemble EITHER real word well
+under any reasonable per-word threshold. This explained exactly why red
+clustered right at āyah boundaries (4/5, 5/6, 6/7 junctions).
+
+**Fix: stop splitting decoded text into words at all.** `word_score.py`
+rebuilt around a single GLOBAL character-level Levenshtein alignment (with
+backtrace) between the normalized reference text and the normalized decoded
+text — the same "character, not word" philosophy `locate_best_span` already
+used for localization, now applied to grading too. For each reference word,
+content_ok is derived from what FRACTION of its own letters found an
+identical letter in the decoded text, via that ONE alignment — never by
+looking for a decoded "word" boundary. A genuinely fused pair of words still
+has each word's own letters sitting compactly together in the decoded
+stream, so this survives boundary loss that would sink any word-splitting
+approach by construction.
+
+**A real new failure mode surfaced while writing regression tests for this**
+(caught before it ever reached real audio): a GLOBAL alignment with no
+locality constraint lets a very SHORT reference word "match" by pure chance
+— e.g. testing 112:1's text against 1:1's actual audio (the canonical "wrong
+ayah" regression case from Phase 1), the word "أَحَدٌ" (aḥad, 3 letters)
+came back falsely "recognized" because a stray ا and ح happened to occur 4
+characters apart inside the unrelated word "الرحيم" elsewhere in the
+decode — 2 of 3 letters "found", passing a plain ratio threshold, despite
+having nothing to do with the actual word. Fixed with a COMPACTNESS check
+independent of word length: `gap = span_of_matched_positions -
+count_of_matched_letters` (`WORD_GAP_SLACK = 1`) — a genuinely-present word,
+even with one missed letter or one stray inserted letter, keeps its matched
+letters clustered tightly together in the decode; a coincidental match on
+unrelated text does not. This single gap-based signal turned out to
+correctly separate ALL three cases found during development: the fake
+"أَحَدٌ" match (gap 2 → rejected), a genuine single-letter ASR slip
+("مَٰلِكِ" decoded as "مالث", last letter wrong, gap 0 → still accepted),
+and a genuine stray-letter insertion ("اهدنا" decoded "اهدينا", gap 1 →
+still accepted) — no word-length-based special-casing needed once the right
+invariant (compactness, not just count) was found.
+
+**Validated in three passes**, tightening the fix each time a real hole was
+found in the previous one:
+  1. Unit tests: 5 new/rewritten `test_score_words_*` tests replacing the
+     old `test_align_words_*` ones (which tested a function, `align_words`,
+     that no longer exists — fully removed, not kept as dead code), plus the
+     pre-existing `test_score_words_catches_short_ayah_mismatch_word_level`
+     regression test (the exact 112:1-vs-1:1-audio case) as the primary
+     guard against over-loosening. Suite: 48/49 (only the pre-existing
+     pytest-only `tmp_path` failure remains).
+  2. Real audio, isolated per-āyah clips (husary, `.build_tmp/probe_word_
+     score_fix.py`): 0 red on āyahs 1–5, 1 red on āyah 6 ("المستقيم" decoded
+     quite differently, "مستتلم" — a genuinely large ASR miss, correctly
+     flagged), 1 red on āyah 7 (the "ولا"+"الضالين" fusion, a harder residual
+     already documented above) — only 2 red words total out of 23.
+  3. Real audio, ONE continuous 50s clip (the harder, worst-case scenario
+     that motivated this whole rewrite): only 3 red words out of ~25 shown
+     (āyah 5's "نستعين" and āyah 7's fusion residual again) — a dramatic
+     improvement over the word-splitting approach's near-total failure on
+     the same input. (Side observation, not investigated further: on this
+     extreme 50s single-clip stress test, `locate_best_span` located the
+     range as "2–7" instead of "1–7" — a location-layer detail unrelated to
+     word grading, and moot in practice since real segments are capped at
+     ~4s by `maxSegmentMs`, never a single 50s blob.)
+
+Restarted the correction server with this fix (superseding the earlier
+per-word-CER version, which is now fully removed from the codebase, not left
+as an unused fallback).
+
+**SUPERSEDED same day, see below** — this fix genuinely helped (the user's
+THIRD screenshot showed āyahs 1-3 and 6 fully green), but surfaced a
+DIFFERENT bug once the content-accuracy noise was mostly cleared away: a
+correctly-graded āyah could still render completely uncolored on screen.
+
+-------------------------------------------------------------------------------
+FOURTH FIX (2026-07-08, same day): word offsets weren't rebased per-āyah —
+a correctly-graded word could render as plain black text
+-------------------------------------------------------------------------------
+User's third screenshot (after the THIRD FIX above) showed a striking, very
+specific anomaly: āyah 4's progress dot was GREEN ("pass") but its text
+("مَٰلِكِ يَوْمِ ٱلدِّينِ") rendered completely UNCOLORED — plain black, no
+underline, as if never graded at all — while neighboring āyahs colored fine.
+A dot showing "pass" REQUIRES that āyah's words to have been graded
+successfully at some point (the status is computed directly from the same
+word objects that get stored for rendering), so this could only be a
+rendering-layer bug, not a grading one.
+
+Root cause, found in `types.py`: `ClipReport.to_dict()` (and the older,
+now-unused `WindowReport.to_dict()`) tags each `WordScore` with which āyah it
+belongs to (`_ayah_for`), but never re-bases its `start_idx`/`end_idx` — they
+stay relative to the START OF THE WHOLE LOCATED RANGE (`evaluate_clip`'s
+`sub_text`, which concatenates every āyah the clip was matched against), not
+to that word's OWN āyah's text. `GradedSurah.tsx` on the frontend, however,
+treats `start_idx`/`end_idx` as offsets into `v.text` — that SINGLE verse's
+own text alone. This only coincidentally works when a clip locates to
+EXACTLY one āyah (`ayah_from == ayah_to`) — sub_text and that āyah's own
+text are then the same thing, offset 0 either way, which is why every
+earlier isolated-per-āyah test (both real audio probes and the unit tests)
+never caught it. The moment a clip's located range spans 2+ āyahs, every
+āyah AFTER the first has a start_idx offset by however long the preceding
+āyah(s) in that range were — comfortably past the length of its own short
+verse text — so the render loop (`for i = start_idx; i < end_idx; i++`)
+never touches any of the CORRECT indices (0..v.text.length) and the word
+silently never colors, even though it graded fine.
+
+**Fix:** `ClipReport._word_dict()` (new helper, used by `to_dict()`) now
+subtracts that word's OWN āyah's start offset (already available in
+`ayah_spans`, which stores per-āyah boundaries within the located range)
+before sending `start_idx`/`end_idx` to the frontend — every word the client
+receives is now offset from the START OF ITS OWN ĀYAH, matching exactly what
+`GradedSurah.tsx` already assumed. Applied the identical fix to the legacy
+`WindowReport.to_dict()` for consistency, even though nothing calls
+`/grade_window` from the frontend anymore.
+
+Validated: new unit test `test_evaluate_clip_to_dict_rebases_offsets_per_ayah`
+(a clip located across 2 fake āyahs, asserting every word's serialized
+start_idx/end_idx stays within ITS OWN verse's length) — suite 49/50 (same
+pre-existing pytest-only failure). Real audio: a genuine 3-āyah husary clip
+(1:1+1:2+1:3 concatenated, `.build_tmp/probe_multiayah_offsets.py`) —
+every word from āyah 2 and 3 (the ones that would have been broken before)
+now serializes with start_idx/end_idx correctly bounded within its own
+verse's length. Restarted the correction server with this fix.
+
+===============================================================================
+FIFTH CHANGE (2026-07-08, same day): sliding-window "live" grading —
+user-requested rearchitecture of the mic capture layer, not a bug fix
+===============================================================================
+User reported the app "not coloring the quran live when I'm reciting" — the
+existing design (`useAutoRecorder`) records a chunk (cut on a detected pause,
+or forced every 4s), THEN sends the WHOLE chunk for grading, so there's
+always a multi-second gap between saying something and it coloring. Asked
+for a genuinely live-feeling design; given a choice between (a) just
+tightening the existing cut-and-wait timings, or (b) real streaming, the
+user chose streaming.
+
+**Honest constraint surfaced to the user before building anything:**
+wav2vec2-large-xlsr-53 on CPU (no GPU in this setup) takes ~1.5-5s to decode
+even a single few-second clip (measured throughout this session). Sub-second,
+literal word-by-word highlighting AS you speak is not achievable with this
+model on CPU — no frontend architecture change fixes that, it's raw compute
+time, and there's no usable small/fast Arabic CTC model to fall back to for a
+cheap preview pass (already investigated and rejected during Phase 4
+calibration work, 2026-06-30: the only available small model has an
+English-only vocab). What IS achievable and was proposed instead: a SLIDING
+WINDOW graded on a fixed ~1.7s timer instead of waiting for a pause or a hard
+4s cap — updates roughly every ~1.7s instead of every ~4-8s, each one
+reflecting the last ~3.2s of what was actually said, which is the practical
+ceiling given the CPU decode cost. User agreed to this scope.
+
+**Implementation — new `app/src/hooks/useRollingRecorder.ts`,** replacing
+`useAutoRecorder` in `Practice.tsx` only (NOT in `Drills.tsx`, which still
+uses the pause-cut design for isolated per-rule examples — out of scope,
+untouched):
+  - Needs raw PCM, not MediaRecorder's encoded chunks — a sliding window has
+    to start at an arbitrary sample, and only the FIRST chunk of a
+    MediaRecorder stream carries the container header (same constraint
+    `useAutoRecorder`'s docstring already documents). Capture goes through a
+    `ScriptProcessorNode` (deprecated but simple and universally supported;
+    an AudioWorklet would need its own module file for no real benefit at
+    this scale) feeding a ring buffer of Float32 chunks, routed through a
+    silent (`gain=0`) node to the destination so the mic input is never
+    played back out loud (ScriptProcessorNode needs SOME destination
+    connection to fire its callback in some browsers).
+  - Every `INTERVAL_MS` (1700ms), if no grading call is already in flight
+    (`gradingRef` gate — SKIPS a tick rather than piling up concurrent CPU
+    decodes, since the interval is deliberately close to the model's own
+    per-clip latency and concurrent calls would only slow each other down
+    without a GPU to parallelize on), slices the last `WINDOW_MS` (3200ms) of
+    buffered samples, skips it if it's pure silence (RMS check, saves a
+    wasted decode call), and hands it to the caller already resampled.
+  - New `app/src/lib/wav.ts` export `pcmFloat32ToWav16kMono(samples,
+    sourceSampleRate)` — factors the existing `blobToWav16kMono`'s
+    resample-to-16kHz-mono step (`resampleTo16kMono`, via an
+    `OfflineAudioContext` render) out into a shared helper, so the new path
+    skips only the `decodeAudioData` step (irrelevant for raw PCM already in
+    hand) while reusing the exact same, already-proven resampling code.
+  - `Practice.tsx`: `handleSegment` renamed `handleWindow`, now receives an
+    ALREADY-encoded 16kHz WAV blob directly (no more `blobToWav16kMono` call
+    in the component — the hook does it), debug-log wording and UI copy
+    updated to describe rolling windows instead of pause-triggered cuts.
+    Because grading is now stateless per rolling window exactly like before
+    (`evaluate_clip`/`locate_best_span` needed no server changes at all),
+    `wordsByAyah`'s merge-and-replace-per-āyah logic naturally self-corrects
+    as later, fresher (and typically more complete) windows overwrite earlier
+    partial ones for the same āyah — no new merge logic needed.
+
+Validated: `npm run typecheck` and `npm run build` both clean. Browser
+smoke-test via the preview tool was BLOCKED this time by an unrelated
+environment issue (the preview proxy failed to connect at the raw HTTP
+level, independent of this change — Vite itself was confirmed healthy via
+its own logs; likely an IPv6-only bind quirk in this sandbox) — and even a
+working preview couldn't exercise the actual mic capture path anyway (no
+real microphone in this sandbox, the standing limitation all session).
+Relying on `tsc`/build cleanliness plus the fact the new hook's lifecycle
+(refs, start/stop, cleanup-on-unmount) directly mirrors `useAutoRecorder`'s
+already-validated pattern.
+
+**NOT yet confirmed by the user's actual voice** — needs their own retry to
+know whether ~1.7s updates actually feel meaningfully more "live", and
+whether `WINDOW_MS`/`INTERVAL_MS` need retuning from real usage (same
+standing caveat as every mic-dependent change this session).
+
+**SUPERSEDED partially, same day** — the rolling design itself worked (log
+showed ~700ms round trips landing every ~1.7s as designed), but it exposed a
+NEW symptom the pause-cut design never had: visible color FLICKER. See below.
+
+-------------------------------------------------------------------------------
+SIXTH FIX (2026-07-08, same day): rolling windows caused visible green→red
+flicker — sticky, monotonic word merge
+-------------------------------------------------------------------------------
+User's fourth screenshot (first real test of the rolling-window design) —
+described the problem precisely: "sometimes it makes the words green than it
+changes it to red" and asked for the app to treat detection like writing the
+recitation down as a paragraph rather than re-deciding each āyah from
+scratch every time.
+
+Root cause: each rolling window is graded completely independently and
+STATELESSLY (by design — that's what makes `evaluate_clip` robust to begin
+with). But `Practice.tsx`'s merge was `setWordsByAyah(prev => ({...prev,
+...grouped}))` — for any āyah touched by a response, the ENTIRE word array
+was replaced wholesale. Since overlapping ~3.2s windows re-decode much of the
+SAME audio repeatedly (the window slides forward only ~1.7s at a time, so
+~45% of each window's audio was already covered by the previous one), a
+later window's slightly different framing of the SAME word (e.g. starting or
+ending mid-syllable relative to the previous window) can occasionally
+mis-grade something the previous window graded correctly — and because the
+whole āyah's array got replaced, that ONE noisy re-grade was enough to flip
+an already-correct word from green back to red on screen.
+
+**Fix:** word-level STICKY, MONOTONIC merge (`handleWindow` in
+`Practice.tsx`), matched by `start_idx` (reliable now that offsets are
+per-āyah-local — see the FOURTH FIX above; this fix depended on that one).
+For each word, if the PREVIOUS result said `content_ok=true` and the NEW
+result says `content_ok=false`, keep the OLD (green) result — a later noisy
+re-grade can never downgrade a word that was already confirmed. A fresh
+green DOES overwrite an old red (upgrades are real progress: the reciter
+finished the word, or a later window's framing simply caught it better).
+Tracked via a `wordsByAyahRef` mirror (read/written synchronously inside
+`handleWindow`, since React state itself updates asynchronously and the next
+rolling-window response can't wait a render cycle to see the merged truth).
+`ayahStatus`'s pass/needs_work ratio is computed FROM the same sticky-merged
+words, so it inherits the same monotonic guarantee automatically — no
+separate status-level special-casing needed, since a fixed word count with
+only-ever-upgrading individual verdicts means the aggregate ratio can only
+stay the same or improve over successive rounds.
+
+**A second, related bug fixed in the same pass:** `memorization.
+recordReview` (the SM-2 spaced-repetition tracker) was being called on
+EVERY rolling-window response that touched a given āyah — with āyahs now
+getting re-confirmed every ~1.7s while being recited, a single real
+recitation of one āyah could fire `recordReview` 3-5+ times in a row,
+inflating its review history as if it had been separately reviewed that many
+times. Fixed with a `recordedAyahsRef` set (reset per sūrah) — records each
+āyah into the memorization tracker only the FIRST time it's graded per
+session, matching the granularity the original pause-cut design had
+(roughly one grading event per āyah).
+
+Both refs (`wordsByAyahRef`, `recordedAyahsRef`) are reset alongside the
+existing per-sūrah state reset effect. Validated: `npm run typecheck` and
+`npm run build` clean. Browser preview blocked again by the same unrelated
+sandbox proxy issue as the FIFTH CHANGE (raw HTTP connection refused before
+any JS runs — confirmed independent of this code, and moot anyway since real
+mic capture can't be exercised in this sandbox regardless).
+
+**NOT yet reconfirmed by the user's actual voice** — needs their retry to
+confirm the flicker is actually gone and upgrades (red→green as a word gets
+re-confirmed) still feel responsive despite the new "never downgrade" rule.
+
+-------------------------------------------------------------------------------
+SEVENTH FIX (2026-07-08, same day): sūrah advanced before the reciter
+finished — repeated phrase ambiguity + no gapless-confirmation guard
+-------------------------------------------------------------------------------
+User reported the app advanced to the next sūrah before they'd finished
+reciting Al-Fātiḥa, and correctly diagnosed the mechanism themselves:
+"الرحمن الرحيم" appears TWICE in Al-Fātiḥa — once as the tail of āyah 1
+("بسم الله الرحمن الرحيم") and again as the ENTIRETY of āyah 3. Since
+`locate_best_span` is deliberately stateless (searches the whole sūrah fresh
+every time, no memory of where the reciter was a moment ago — see the
+SECOND MAJOR REARCHITECTURE above), a short phrase that genuinely repeats
+elsewhere in the same sūrah gives the search a real ambiguity to resolve with
+NO positional information to break the tie. If a window's match ever locks
+onto the WRONG occurrence (or a chain of borderline matches drifts forward),
+`ayah_to` can jump further ahead than the reciter actually reached —
+including, worst case, appearing to reach the sūrah's last āyah and
+triggering the "finished, roll to next sūrah" transition prematurely.
+
+**Two complementary fixes, addressing both ends of the problem:**
+
+1. **Backend — `near_ayah` soft proximity hint (`content_check.
+   locate_best_span`, threaded through `evaluate.evaluate_clip` and the
+   `/grade_clip` endpoint's new optional `near_ayah` form field).** When
+   multiple candidates score within `tie_epsilon` (0.05) of the best CER,
+   the one CLOSEST to `near_ayah` wins the tie — but a candidate that's
+   CLEARLY better (outside that epsilon) always wins regardless of distance,
+   so this can never override real content evidence, only resolve genuine
+   near-ties. Deliberately NOT a repeat of the old cursor design's mistake
+   (a hard constraint that could get "stuck") — it's advisory only.
+   `Practice.tsx` sends its current `highlightAyah` as this hint on every
+   `gradeClip` call (`lib/correction.ts`'s `gradeClip` gained an optional
+   third `nearAyah` param). Validated: new unit test
+   `test_locate_best_span_near_ayah_breaks_tie` (two āyahs with IDENTICAL
+   text — a clean, deliberately-constructed genuine tie — confirms the hint
+   correctly picks whichever is closest); real husary audio of the ambiguous
+   phrase itself (`.build_tmp/probe_near_ayah.py`) confirms the hint does
+   NOT interfere with an unambiguous match (a clean recitation of "الرحمن
+   الرحيم" alone locates to āyah 3 regardless of the hint, since its CER is
+   unambiguously best there — this specific isolated case was never actually
+   tied in practice, since āyah 1's candidate needs the preceding "بسم الله"
+   that isn't in the clip; the REAL ambiguity this guards against arises from
+   noisier/messier window framing in an actual continuous rolling-window
+   session, harder to construct as a clean isolated audio test).
+
+2. **Frontend — gapless-confirmation guard on the sūrah-advance trigger**
+   (`Practice.tsx`, directly matching the user's own words: "if it skips it
+   stop"). Even with the hint above reducing HOW OFTEN a bad jump happens, it
+   doesn't guarantee it can never happen — so the "roll to the next sūrah"
+   transition now ALSO requires that every earlier āyah has ALREADY been
+   separately confirmed (`ayahStatus[...] === "pass"`) before trusting that
+   the located last āyah means the sūrah is actually finished. A new
+   `ayahStatusRef` mirrors `ayahStatus` synchronously (same reason as
+   `wordsByAyahRef`) so this check can run within the same async
+   `handleWindow` call that decides whether to advance. Reset alongside the
+   other per-sūrah refs.
+
+Validated: `npm run typecheck`/`build` both clean; Python suite 50/51 (new
+test added, same pre-existing pytest-only failure). Restarted the correction
+server with the backend half of this fix.
+
+**NOT yet reconfirmed by the user's actual voice** — needs a full real
+retry of Al-Fātiḥa to know whether the premature-advance symptom is actually
+gone.
+
+**SUPERSEDED (deepened) same day** — user shared a follow-up screenshot,
+clarified they'd recited ONLY āyah 1, and the log showed the server DID
+mislocate a window as 1:3. The SEVENTH FIX's `near_ayah` hint couldn't
+rescue this specific case because the two candidates weren't actually a
+near-tie under the OLD prefix/suffix scoring — see below for the real root
+cause and fix.
+
+-------------------------------------------------------------------------------
+EIGHTH FIX (2026-07-08, same day): prefix/suffix CER used a guessed slack
+length that could swallow the wrong amount of the candidate window —
+replaced with a proper free-end-gap alignment DP
+-------------------------------------------------------------------------------
+Reciting ONLY Al-Fātiḥa 1:1 ("بسم الله الرحمن الرحيم") got the server to
+locate 1:3 instead — confirmed by the user ("here I just recited the first
+ayah"), matching the mechanism flagged in the SEVENTH FIX: a rolling window
+holding only the last ~3.2s of audio can scroll PAST "بسم الله" once enough
+time has passed, leaving only "الرحمن الرحيم" — which is 1:3's entire text,
+a perfect match — while 1:1's own text needs "بسم الله" that's no longer in
+the clip. Investigating WHY the SEVENTH FIX's `near_ayah` tie-break didn't
+catch this revealed the tie wasn't actually happening: `_suffix_aware_cer`
+(added same day, see SEVENTH FIX/SUFFIX section above) sized its comparison
+window via `min(len(window), int(len(hyp)*1.3)+5)` — a guessed slack length
+carried over unchanged from the ORIGINAL `_prefix_aware_cer`. For a short
+single-āyah candidate close in length to the clip itself (1:1's full text is
+only ~19 normalized characters, hyp "الرحمن الرحيم" is 12, and the slack
+formula computes a 20-character target), that guessed length EXCEEDED the
+whole candidate window — degrading the "suffix" comparison back into a
+WHOLE-WINDOW comparison, unable to trim out "بسم الله" at all, scoring 1:1
+just as badly as before the SEVENTH FIX (confirmed via direct debugging:
+prefix CER and suffix CER came out IDENTICAL, 0.368, both accidentally
+comparing against the same full 19-char window).
+
+**Root cause: guessing a fixed comparison-window length by formula is
+inherently fragile whenever the candidate window's own length is close to
+the clip's length** — there's no slack constant that both (a) tolerates a
+few characters of genuine ASR insertion noise and (b) reliably trims out
+exactly the right amount of "extra" content when that extra content
+(here, "بسم الله", ~7 characters) is smaller than the slack margin needed
+for (a). A synthetic regression test written to lock in the fix
+(`test_locate_best_span_tail_of_longer_ayah_ties_with_shorter_repeat`) caught
+this immediately — it failed even though the SEVENTH FIX's logic was
+otherwise sound, which is exactly why it's valuable to write the test before
+declaring a fix done rather than trusting reasoning alone.
+
+**Fix: stop guessing a comparison-window length at all.** `_prefix_aware_cer`
+/`_suffix_aware_cer` (slice-then-Levenshtein) replaced by `_prefix_fit_cer`/
+`_suffix_fit_cer` — a proper free-end-gap edit-distance DP:
+  - `_prefix_fit_cer(hyp, window)`: standard Levenshtein DP with `dp[0][j]=j`
+    (hyp anchored to window's own START) but the ANSWER is `min` over every
+    `dp[len(hyp)][j]` instead of just `dp[len(hyp)][len(window)]` — i.e. the
+    DP itself finds the best-fitting boundary where hyp "ends" within
+    window, with window free to extend further at NO cost. No slack constant
+    to guess wrong.
+  - `_suffix_fit_cer(hyp, window)`: `_prefix_fit_cer` called on BOTH strings
+    REVERSED — edit distance is invariant under simultaneous reversal, and
+    "hyp's end anchored to window's end, window free on the left" is exactly
+    "hyp's start anchored to window's start, window free on the right" once
+    reversed. One DP implementation, no second one to keep in sync.
+  - Both anchor ONE end of hyp to the corresponding end of window (unlike
+    full local/Smith-Waterman alignment, which was already rejected earlier
+    this session for letting a short hyp match ANYWHERE with no penalty for
+    match weakness — a muqattaʿāt-scale risk this deliberately avoids by
+    still requiring hyp's start-or-end to align with window's start-or-end,
+    not float freely in the middle).
+  - `locate_best_span` takes `min(_prefix_fit_cer(...), _suffix_fit_cer(...))`
+    per candidate, same as before, just with the more robust scoring
+    underneath. The bigram prefilter (for long clips) already got its own
+    prefix+suffix-aware fix as part of the SEVENTH FIX and needed no further
+    change here.
+
+Validated: the new regression test now passes; full suite 50/52 (2 new
+tests this round, same pre-existing pytest-only failure). Real audio — a
+genuinely truncated husary 1:1 clip, cut at 2.3s to simulate exactly what a
+rolling window would hold after scrolling past "بسم الله"
+(`.build_tmp/probe_tail_of_ayah1.py`): **locates correctly as 1:1 even with
+NO hint at all** (cer=0.143, the residual reflecting that the manual 2.3s
+cut point also clipped a bit into "الرحمن" itself); with `near_ayah=3`
+explicitly, it correctly flips to 3:3, proving the tie-break mechanism now
+actually engages when the ambiguity is real. Re-ran the broader per-āyah
+husary regression probe (`.build_tmp/probe_word_score_fix.py`) — identical
+results to before this fix (2 red words total across all 7 āyahs), confirming
+no regression from replacing the CER metric. Restarted the correction
+server.
+
+**NOT yet reconfirmed by the user's actual voice** — this is the second
+attempt at fixing the exact same reported symptom; needs a real retry to
+confirm it's actually resolved this time, not just in the lab.
+
+**CONFIRMED FIXED by the user's real retry same day** — the EIGHTH FIX
+resolved the tail-of-āyah mislocation. User then reported a NEW, distinct
+symptom on the app's next test — see below.
+
+-------------------------------------------------------------------------------
+NINTH FIX (2026-07-08, same day): the longest āyah showed red immediately
+and "didn't let me finish reciting" — unspoken words graded as wrong
+-------------------------------------------------------------------------------
+User: "in the last ayah and the longest one in fatiha it directly show in
+red and don't let me finish reciting" — Al-Fātiḥa 1:7 (9 words, by far the
+longest) turning red before the reciter had said the whole thing. User's own
+diagnosis, unprompted: "I think the problem is that when you check you pass
+all the audio but the recitor will speak word by word" — exactly right.
+
+Root cause: `evaluate_clip`'s `sub_text` for a located single-āyah range is
+that āyah's WHOLE text, and `score_words`'s per-word grading used a GLOBAL
+(fully-consuming, both ends anchored) character alignment between the
+decoded clip and that whole text. For a rolling-window clip that only
+covers the FIRST few words of a long āyah still being recited, the global
+alignment is FORCED to "explain" the entire remaining text somehow — it does
+so via deletions, which look identical to "wrong word" to the existing
+red/green logic. The trailing, simply-not-yet-spoken words showed red before
+the reciter had even reached them.
+
+**Fix, in three layered passes** (each one found a real problem the
+previous pass didn't fully solve — validated against REAL truncated Al-Fātiḥa
+1:7 audio at every step, not just synthetic tests):
+
+  1. **Exclude unreached words instead of grading them red.** New
+     `_reached_bound(hyp, ref)` in `word_score.py` — a free-TRAILING-gap
+     alignment DP (hyp anchored to ref's start, ref free to extend past hyp
+     at zero cost; same shape as `content_check._prefix_fit_cer`, just
+     returning the ARGMIN position instead of the cost) finds how far into
+     the āyah the decode's content plausibly reaches. A word starting more
+     than `NOT_REACHED_SLACK` (4 normalized chars) past that boundary is
+     OMITTED from `score_words`'s returned list entirely — not marked red —
+     so it renders exactly like a word that's never been graded (neutral),
+     not like a mistake. The word immediately following the reached
+     boundary is deliberately left un-excluded: from a single clip there's
+     no way to tell "not yet said" from "recitation genuinely stopped
+     here", and the existing `test_score_words_catches_missing_word_amid_
+     fusion` regression test already requires that adjacent case to still
+     read as a real mismatch — this fix is specifically about the FAR tail,
+     which is unambiguous.
+
+  2. **`_reached_bound` itself was fooled by coincidental scattered matches
+     on real audio.** First real-audio test (a genuine 3-second truncation
+     of husary's 1:7) showed NOTHING got excluded — `_char_align_matched`'s
+     GLOBAL alignment (used to compute where matches occurred) is forced to
+     explain the ENTIRE 43-character reference even when the decode is only
+     14 characters, and while doing so it can pick up isolated, coincidental
+     common-letter matches scattered far into the "padding" it's forced to
+     traverse — the raw "furthest matched position" scan came out at
+     character 32 of 43, nowhere near where the decode's real content
+     actually ended (~14). Fixed by computing `reached_bound` via the
+     free-trailing-gap DP (immune to this — it's never forced to explain
+     content beyond what hyp can account for) INSTEAD OF scanning
+     `_char_align_matched`'s raw output for this purpose.
+
+  3. **Even with the correct boundary, individual words within the reached
+     region still graded wrong on real audio.** Second real-audio pass:
+     "ٱلَّذِينَ" (clearly present in the decode) still showed red. Root
+     cause: `_char_align_matched` was still being run against the FULL
+     43-character reference for the actual per-word grading, not just for
+     finding the boundary — with hyp only 14 characters, the DP's globally
+     cheapest way to "explain" all 43 characters didn't have to route
+     through a clean, intuitive alignment of the real words, since many
+     different paths tied for the same total cost. Fixed by truncating the
+     reference to `ref_norm[:reached_bound + 1 + NOT_REACHED_SLACK]`
+     BEFORE running the detailed per-word alignment — hyp now aligns
+     against a similarly-sized reference, matching the actually-spoken
+     words cleanly instead of arbitrarily.
+
+  Two more bugs surfaced and fixed by the unit tests written alongside this
+  (before further real-audio testing was even needed):
+  - `_reached_bound`'s tie-breaking picked the SMALLEST position achieving
+    the minimum edit cost, not the largest — several trailing positions
+    routinely tie once hyp is "fully spent" (extra reference characters cost
+    nothing either way past the true match point), and picking the smallest
+    silently under-credited how far hyp actually reached. Caught by
+    `test_score_words_substitution_and_deletion` (a clean word DELETED in
+    the middle, "بسم [الله] الرحيم", tied at equal cost for stopping right
+    after "بسم" vs continuing through "الرحيم" — picking the smaller one
+    wrongly excluded "الرحيم", which the decode had genuinely matched).
+    Fixed: prefer the LARGEST tied position.
+  - Basmala-prefix stripping (`_strip_basmala_prefix`) broke `reached_bound`
+    entirely for sūrah 112 (and similar) — the removed prefix is a DATA
+    ARTIFACT (present in the text column, never in the actual audio), so
+    anchoring the free-trailing-gap DP to `text` index 0 (the basmala's own
+    start) made a decode that matched 112:1 perfectly still look like it had
+    "reached" nothing (the basmala obviously doesn't match at all), excluding
+    every real word. Caught immediately by the pre-existing `test_score_
+    words_strips_basmala_prefix_on_ayah1` regression test. Fixed: anchor
+    `reached_bound` to the position of the FIRST SURVIVING word (post-strip),
+    not raw text index 0.
+
+Validated end to end: full suite 51/53 (2 new tests, same pre-existing
+pytest-only failure); real husary 1:7 truncated to its first 3 seconds
+(`.build_tmp/probe_partial_ayah7.py`) now returns only 4 words — the 3
+genuinely-spoken ones correctly green, the immediate-next word red (the
+accepted, unavoidable ambiguity), and the other 5 correctly OMITTED rather
+than red; re-ran the full per-āyah husary regression probe
+(`.build_tmp/probe_word_score_fix.py`) — complete recitations of every āyah
+unaffected (identical results to before this fix), confirming this only
+changes behavior for genuinely-partial clips.
+
+**A related risk fixed proactively in `Practice.tsx`, before it could be
+separately reported:** since unreached words no longer inflate an āyah's
+word count with red entries, a partially-recited long āyah's `content_ok`
+ratio is now computed over FEWER words — meaning just the first couple of
+(correct) words could make an incomplete āyah look "100% passed", risking
+the exact SEVENTH-FIX premature-sūrah-advance failure mode again, just via
+a new path. Fixed with a word-count completeness check (`expectedWordCount`,
+derived from the āyah's own verse text) applied both to the general
+`ayahStatus` "pass" determination and to the sūrah-advance `lastAyahPassed`
+check — an āyah can't read as "pass" until close to its full word count has
+actually been graded. Also fixed, found while implementing this: the
+word-merge across rolling-window responses was REPLACING an āyah's word
+array wholesale rather than UNIONING it — since a later window can
+legitimately stop covering an earlier word once the window slides past it
+(exactly what the exclusion mechanism above now does on purpose), a
+previously-confirmed word could silently vanish from the display if the
+merge didn't preserve it. Fixed by keying the merge on `start_idx` and
+unioning with the previous round instead of replacing.
+
+**NOT yet reconfirmed by the user's actual voice** for this NINTH fix
+specifically (the EIGHTH fix, previously reported as this same conversation
+turn's context, WAS independently confirmed) — ask for a retry reciting the
+longest āyah (1:7) slowly, word by word, and confirm the tail no longer
+shows red before it's actually been said.
+
+**CONFIRMED WORKING (mostly) by user's real retry same day** — screenshot
+showed the NINTH FIX's intent clearly working: most of a partially-recited
+1:7 colored green as actually spoken, only the immediate-next word red (the
+accepted ambiguity), the rest correctly blank instead of a wall of red.
+Follow-up after finishing the FULL recitation surfaced two more findings —
+one concrete bug, one open question.
+
+-------------------------------------------------------------------------------
+TENTH FIX (2026-07-08, same day): last word(s) of a completed recitation
+stayed permanently black — grading only ever fires on a timer
+-------------------------------------------------------------------------------
+User: "I recited all the surah even the last word in black" — after finishing
+correctly, the tail of the last āyah never got graded at all (stayed
+uncolored forever, not red — that part of the NINTH FIX worked — just never
+graded in the first place). Root cause: `useRollingRecorder` only grades on
+a fixed `INTERVAL_MS` (1700ms) timer. Stopping right after finishing a
+recitation (the normal thing to do) can beat the NEXT tick to the buffer —
+there was no mechanism to grade whatever's left over before tearing
+everything down.
+
+Fix: `gradeNow(force)` extracted from the interval `tick()` (same logic,
+just parameterized) — `force=true` skips the "wait for half a window's
+worth of audio" minimum. `stop()` now calls `gradeNow(true)` BEFORE tearing
+down the audio graph, so whatever's still in the buffer gets one last
+grading attempt instead of being silently discarded. `ctx.sampleRate` is
+captured into a local BEFORE `stop()` closes the AudioContext, since the
+grading call is async and races the synchronous teardown that follows it —
+the WAV encoding itself doesn't depend on the closed context (it opens its
+own temporary one for resampling), so this is safe.
+
+Validated: `npm run typecheck`/`build` clean. Frontend-only change, no
+correction-server restart needed. **NOT yet reconfirmed by the user's
+actual voice.**
+
+-------------------------------------------------------------------------------
+OPEN QUESTION (2026-07-08, same day, not yet actioned): some words shown
+red were reported as correctly pronounced
+-------------------------------------------------------------------------------
+Same message: "the red ones normally are good pronounced" — at least one
+word (the screenshot showed "المغضوب" mid-sūrah) marked red despite (per the
+user) correct pronunciation. Two live hypotheses, NOT yet distinguished:
+  (a) genuine wav2vec2 ASR difficulty on that specific word/phoneme sequence
+      — an already-documented, pre-existing model limitation independent of
+      any of today's fixes;
+  (b) a boundary-effect artifact of the NINTH FIX's `reached_bound`
+      truncation — a word that happens to sit right at a rolling window's
+      edge across MULTIPLE consecutive windows (never centered in a window
+      with clean surrounding context) could get a degraded alignment each
+      time, and — since the STICKY MERGE only protects a word ONCE it's
+      shown green at least once — never gets the chance to.
+Asked the user for the Activity log's `decoded_text` around the flagged
+word(s) (the log now persists after stopping, per the earlier debug-log
+fix) to tell these apart before attempting a further fix — guessing further
+without that evidence risks the same kind of premature, unvalidated change
+already walked back once this session (the original slack-based `_suffix_
+aware_cer`, replaced by the EIGHTH FIX's proper alignment DP after a
+regression test caught it being wrong).
+
+**RESOLVED same day — root cause found and fixed with real evidence, not
+guessed.** User's follow-up screenshot included the newly-added log detail
+directly answering the open question: the decode for one window
+(5.0-8.2s of husary's real 1:7, tested directly per below) was
+`'المَغْضُوبِ عَلَيْهِمْ وَلَض'` — the word IS in the decode, near-perfectly,
+yet still showed red. Confirms hypothesis (b), NOT a raw ASR limitation.
+
+-------------------------------------------------------------------------------
+ELEVENTH FIX (2026-07-08, same day): mid-āyah rolling-window clips graded
+against the WRONG part of the reference — reached-region was prefix-only
+-------------------------------------------------------------------------------
+Root cause: the NINTH FIX's `_reached_bound` only ever anchored hyp to
+`ref_norm`'s own START (a free-TRAILING-gap alignment) — a reasonable
+assumption for the FIRST rolling window of an āyah, but wrong for every
+later one. With `WINDOW_MS=3200` against a 15-second āyah (1:7), most
+windows land somewhere in the MIDDLE, not the start. A mid-āyah clip like
+"المغضوب عليهم..." was forced through a DP that tried to explain it as
+starting from the āyah's own opening ("صراط..."), which it obviously
+doesn't — so the computed "reached" boundary came out nowhere near where
+the clip's real content was, and the subsequent region-truncated detailed
+alignment (also from the NINTH FIX) compared hyp against the wrong slice of
+the reference entirely, producing an unpredictable, often-wrong verdict for
+words that were actually decoded correctly.
+
+**Fix: `_reached_bound` (single boundary, free-trailing-gap only) replaced
+with `_local_reached_region` (a start/end PAIR, free at BOTH ends)** — a
+proper local/"fitting" alignment that finds the best-matching contiguous
+region of the reference for the fully-consumed hypothesis, handling the
+clip being the āyah's BEGINNING, END, or a MIDDLE segment uniformly, with
+no assumption about which. `_word_match_ratios` restricted the reached
+region to `[reached_start - NOT_REACHED_SLACK, reached_end + 1 +
+NOT_REACHED_SLACK]` (padded both sides now, not just one) for the
+subsequent detailed alignment, and a word is excluded (`None`) only if its
+own span doesn't overlap that padded region AT ALL, from either side —
+previously only the "too far ahead" side was checked.
+
+Deliberately safe to do as a genuinely LOCAL (free-both-ends) alignment
+here, unlike `content_check.locate_best_span`'s earlier-rejected
+Smith-Waterman attempt for finding WHICH āyah a clip belongs to (rejected
+for letting a short hyp match almost anywhere across an ENTIRE sūrah by
+chance): this alignment only ever searches within a SINGLE, ALREADY-LOCATED
+āyah's text (tens of characters), against hyp that typically covers several
+whole words (15-30+ normalized characters from a ~3s window) — a
+structurally much safer length ratio, and it only decides which words get
+GRADED AT ALL, not the final content_ok verdict (still separately
+compactness-checked per word via `WORD_GAP_SLACK`, unchanged).
+
+Validated: full suite still 51/53 (no regressions — same pre-existing
+pytest-only failure); the SAME real husary mid-āyah clip that exposed the
+bug (`.build_tmp/probe_maghdoub.py`, 5.0-8.2s of 1:7) now grades
+"ٱلْمَغْضُوبِ" `content_ok=True` (previously always red regardless of how
+cleanly it was decoded); re-ran both the isolated-per-āyah regression probe
+and the earlier partial-1:7 probe — both unchanged from before this fix,
+confirming this only corrects the specific mid-clip case without disturbing
+anything already working. Restarted the correction server.
+
+**Known, accepted residual imperfection, not chased further:** a word
+sitting at the EDGE of a clip's reached region (e.g. the word immediately
+before "المغضوب" in a clip that starts mid-word) can still show red instead
+of being excluded in some individual windows — visible in the validation
+run above ("عليهم"/"غير" still flagged in isolation). In the REAL rolling-
+window session (not an isolated single-clip test), this is substantially
+mitigated by the SIXTH FIX's sticky merge: once ANY window correctly grades
+a word green, a later window's boundary imprecision can never downgrade it
+back to red. Chasing a perfect boundary here would mean re-deriving
+something close to true word-level timestamps, out of proportion to the
+now-small remaining impact.
+
+**NOT yet reconfirmed by the user's actual voice** for this specific fix.
+
+-------------------------------------------------------------------------------
+TWELFTH CHANGE (2026-07-08, same day): removed sūrah auto-advance —
+user-requested, not a bug fix
+-------------------------------------------------------------------------------
+User: "don't pass automatically let me see my progress." The SEVENTH FIX's
+gapless-confirmation guard made the auto-advance-to-next-sūrah trigger more
+TRUSTWORTHY, but never addressed the underlying complaint that auto-
+advancing AT ALL replaces the screen (and every green dot / colored word
+just earned) with a blank next sūrah before the reciter has a chance to see
+what they just finished.
+
+Fix: removed the `goToSurah(surah + 1)` auto-trigger and everything that
+only existed to gate it (`lastAyahPassed`, `isLastOfSurah`,
+`allPriorConfirmed`, and the now-fully-unused `ayahStatusRef` mirror —
+deleted rather than left dead). In its place, a `surahComplete` value
+derived straight from `ayahStatus` (`every` āyah showing `"pass"`) drives a
+completion banner ("🎉 Well done — you finished this sūrah correctly!")
+with a manual "Next sūrah →" button — the reciter now decides when to move
+on, and can sit and look at their fully-graded sūrah for as long as they
+want first. The per-āyah completeness gate added in the NINTH FIX (an āyah
+can't read "pass" from just its first couple of words) is kept — it's still
+correct and useful for the banner's own accuracy, just no longer described
+in terms of gating an auto-advance that no longer exists.
+
+Validated: `npm run typecheck`/`build` clean. Frontend-only, no correction-
+server restart needed.
+
+===============================================================================
+PHASE 3 — Tajweed drills screen ("Duolingo for tajweed")
+===============================================================================
+Goal: a standalone practice area, independent of "reciting a surah", where
+the user picks ONE rule (e.g. ikhfa, idghaam ghunnah, madd muttasil) and gets
+short curated example words/ayahs to drill, with instant grading + a
+friendly correction message, available any time.
+
+Reuse, don't rebuild: `tajweed.correction.calibrate.select_focus_ayahs`
+already picks the shortest ayahs containing a given rule (built for
+calibration sampling, Phase 4 2026-06-30) — it's the natural source for
+"good drill examples per rule", just repurposed for lesson content instead of
+calibration data collection.
+
+Structure:
+  - New screen `Practice` (rename current one to something like
+    `PracticeFreeRecitation`, or keep both — decide naming when we get here)
+    listing the 18 tajweed rules as "lessons", each showing 3-5 example
+    words/ayahs, a record button, instant single-rule grading (fast — one
+    short clip, one rule, not a whole ayah's worth of rules).
+  - Gamification (streaks/XP) is COSMETIC, do last, don't let it block the
+    actual correction quality.
+
+Status: DONE 2026-07-07. Built on top of the continuous-recitation machinery
+from Phase 2 rather than the offline Python `select_focus_ayahs` — that
+function does the equivalent pick for CALIBRATION SAMPLING (an offline batch
+concern); a live Supabase query is the right tool for "give me 5 examples for
+rule X on demand from the browser", so `useDrillExamples(rule)`
+(app/src/hooks/useQueries.ts) queries `tajweed_segments` (capped at 60 rows —
+common rules like ikhfa/ghunnah occur thousands of times in the full text,
+no need to pull them all), dedupes to distinct āyahs, fetches their `verses`
+text, and ranks by length (shorter = quicker/better drill example).
+
+Refactored for reuse (DRY, not premature — genuinely shared by 2 screens
+now): extracted `GradedAyah` into its own component
+(app/src/components/GradedAyah.tsx) and `ayahPassed`/`STATUS_COLOR`/
+`VERDICT_COLOR` into `app/src/lib/grading.ts`, also adding `GRADABLE_RULES` —
+the 10 of 18 TAJWEED_RULES actually covered by rules.py's v1 measurement
+(madd_2/muttasil/munfasil/6/246 + ghunnah/idghaam_ghunnah/ikhfa/iqlab/
+ikhfa_shafawi). The other 8 (qalqalah, hamzat_wasl, lam_shamsiyyah, silent,
+idghaam_no_ghunnah/shafawi/mutajanisayn/mutaqaribayn) have no acoustic
+measurement yet — drilling them would always come back "no rules to grade",
+so `Drills.tsx`'s rule picker shows them disabled with a "Coming soon" label
+instead of offering a drill that can't give real feedback (same trust
+principle as everywhere else in this roadmap: don't fake confidence).
+
+New screen `app/src/screens/Drills.tsx` (route `/drills`, linked from the
+Practice screen rather than added to the crowded 7-item bottom nav): rule
+picker grouped by RULE_GROUPS → select a gradable rule → drills 3-5 short
+examples using the SAME continuous auto-recording flow as Practice.tsx
+(useAutoRecorder, auto-advance on pass, stay-and-retry on fail) — just
+sourced from useDrillExamples(rule) instead of a muṣḥaf page. Finishing all
+examples shows a "🎉 Drill complete!" screen instead of Practice's page-
+rollover (there's no "next rule" to roll onto). `npm run typecheck`/`build`
+clean. Verified live: rule grid renders with the correct 10 gradable / 8
+"Coming soon" split; selecting "Hiding" (ikhfa) loaded 5 REAL short example
+āyahs from live Supabase (2:18 among them), rule name/Arabic/description
+displayed correctly; back-to-rules navigation confirmed after a transient
+preview-proxy hiccup (same known flakiness noted in memory, not an app bug).
+NOT tested with a real microphone (same acoustic-tuning caveat as Phase 2 —
+needs the user).
+
+===============================================================================
+PHASE 4 — Memorization (hifz) tracker
+===============================================================================
+Goal: track, per (surah, ayah), a memorization status: new / learning /
+reviewing / mastered, plus last_reviewed_at.
+
+New Supabase table `memorization_progress`:
+  user_id (if/when auth exists — today the app has no auth, so this may
+  start as a local-only table via localStorage/IndexedDB, matching the
+  existing `useBookmarks` pattern in app/src/hooks/useBookmarks.ts, and
+  migrate to a real Supabase table with RLS once accounts exist).
+  columns: surah, ayah, status, last_reviewed_at, streak_count.
+
+Feed status transitions FROM the correction results: e.g. reciting an ayah
+green enough times in a row bumps it from "learning" to "reviewing".
+
+Status: DONE 2026-07-07. Built local-only exactly as sketched — no Supabase
+table yet (no auth to key it by), `app/src/hooks/useMemorization.ts` mirrors
+`useBookmarks.ts`'s localStorage pattern precisely. `MemorizationEntry` /
+`MemorizationStatus` added to lib/types.ts — status is "learning" |
+"reviewing" | "mastered" only (no explicit "new": an ayah with no entry at
+all IS new, no need to pre-populate 6236 rows). `recordReview(surah, ayah,
+passed)` drives the streak: a pass increments it (crossing 3 → "reviewing",
+7 → "mastered", both deliberately simple placeholders — Phase 5's SM-2
+scheduler is the more rigorous mechanism this feeds into); a miss resets the
+STREAK but does not downgrade a status already reached, so one bad take
+doesn't erase progress built from many good ones, matching the "trusted,
+not punishing" spirit elsewhere in this roadmap.
+
+Wired into `Practice.tsx`'s `handleSegment` (the SAME continuous-recitation
+grading callback from Phase 2) — every real attempt feeds the tracker,
+skipping `content_status==="content_mismatch"` since that's ambiguous (wrong
+āyah selected, mic issue) rather than a genuine right-word-wrong-tajweed
+miss and shouldn't reset a streak. Not wired into Drills.tsx — drilling one
+isolated rule on a cherry-picked short āyah isn't really "memorizing that
+āyah", so it deliberately doesn't feed this tracker.
+
+New screen `app/src/screens/Memorization.tsx` (route `/memorization`, linked
+from 3 new Home quick-links added alongside it — Practice/Drills/
+Memorization — since Home's grid already had 3 slots and wrapping to 2 rows
+of 3 needed no layout change). Shows a per-surah stacked progress bar
+(mastered/reviewing/learning/not-yet-attempted counts) computed by
+aggregating `useMemorization().entries` against `useSurahs()`'s `ayah_count`
+— only surahs with at least one tracked āyah are shown (114 empty bars would
+be noise). `npm run typecheck`/`build` clean. Verified live: empty state
+renders correctly; seeded fake localStorage data (5 entries across 2 surahs)
+and confirmed the aggregation is exactly right (Al-Fātiḥa 2 mastered + 1
+reviewing + 1 learning + 3 untouched = 7 āyahs ✓; Al-Ikhlāṣ 0+0+1+3 = 4 ✓)
+and the "N āyahs mastered" header total is correct across surahs.
+
+Not yet migrated to Supabase (correctly deferred — no auth exists to key
+rows by user yet, exactly as this section anticipated).
+
+===============================================================================
+PHASE 5 — Spaced repetition (SRS)
+===============================================================================
+Goal: schedule WHEN to re-review each memorized ayah, using a standard
+algorithm (SM-2 is the well-trodden choice: ease_factor, interval_days,
+next_review_at, adjusted by recall quality).
+
+Feed the "recall quality" input FROM Phase 1's word-level grading (green/
+yellow/red ratio for that ayah on this review) instead of a manual self-
+rating — this is the payoff for building the earlier phases first: SRS
+scheduling becomes automatic instead of another button the user has to
+press honestly.
+
+New screen: "Review" — shows ayahs due today (from memorization_progress),
+one-tap into the recitation/grading flow, auto-advances the schedule based
+on the grade.
+
+Status: DONE 2026-07-07. Real SM-2 (not a placeholder) — `app/src/lib/srs.ts`
+implements the classic algorithm (`applySM2(prev, quality, now)`: ease
+factor >= 1.3, interval days, repetitions -> nextReviewAt). Verified with a
+standalone node script (same discipline as pauseDetector.ts) against the
+textbook SM-2 worked example: quality=4 (the formula's EF-NEUTRAL point, not
+5 — an assumption my FIRST draft of the check script got wrong and which the
+script itself caught, see below) produces the canonical 1, 6, 15, 38-day
+intervals with ease factor staying EXACTLY 2.5; quality=5 correctly
+increases ease factor each time (faster-growing intervals for consistently
+perfect recall — correct behavior, not a bug); a miss (quality<3) resets
+repetitions+interval and lowers ease factor; ease factor floors at 1.3 under
+repeated poor quality.
+
+Fed by REAL grading, per the roadmap's original intent — not a manual self-
+rating: `srsQuality(rep)` in lib/grading.ts maps a GradeReport to 5 (all
+green) / 4 (some yellow, no red) / 2 (any red — below SM-2's quality>=3
+"pass" threshold). `MemorizationEntry` (lib/types.ts) gained
+easeFactor/intervalDays/repetitions/nextReviewAt; `useMemorization.
+recordReview` now takes a quality score instead of a bare boolean, derives
+Phase 4's pass/fail internally (quality>=3) for the streak/status overview,
+AND always runs the SM-2 update to reschedule — Practice.tsx's call site
+updated to pass `srsQuality(rep)`.
+
+New screen `app/src/screens/Review.tsx` (route `/review`, linked from Home
+and from a new due-count banner on Memorization.tsx): lists āyahs whose
+nextReviewAt has passed (frozen as of when the screen opened, via a
+`sessionStart` state, so newly-due items don't reshuffle the list mid-
+session), sorted most-overdue-first, fetched via a new generic
+`useVersesByPairs(pairs)` hook (app/src/hooks/useQueries.ts — verses for an
+arbitrary non-contiguous list of (surah,ayah), re-sorted client-side since
+Supabase's `.or()` doesn't promise order; this is the same building block
+Drills.tsx's useDrillExamples could have used but didn't need, now genuinely
+reused). Same continuous auto-recording flow as Practice/Drills. `npm run
+typecheck`/`build` clean. Verified live: seeded 3 fake entries (2 due, 1 not
+due for 5 more days) — Review correctly showed ONLY the 2 due ones, ordered
+most-overdue-first, with real verse text fetched from Supabase; Memorization
+screen's new due-count banner ("🔁 2 āyahs due for review →") appeared and
+linked correctly, while its Phase-4 aggregation kept working unchanged.
+
+ALL 6 ROADMAP PHASES NOW COMPLETE (2026-07-06/07). Remaining open items are
+the cross-cutting concerns below (acoustic tuning needs real-mic testing by
+the user; performance/reliability items) — not new phases, ongoing
+maintenance as the app gets real use.
+
+===============================================================================
+PHASE 6 — Interface overhaul (Journey Map, Active Slate, Streak/Joker)
+===============================================================================
+2026-07-09. After the correction engine stabilized, the user asked for a
+full interface design pass (see the "Tartīl — The Guided Recitation Journey"
+design paper, a Claude Artifact iterated over ~6 rounds — URL in
+memory/tartil-interface-spec.md) and then to start coding it. This phase is
+that build, following the paper's §09 recommended order. Deliberately reuses
+Phases 0-5's existing data (word-level grading, useMemorization's per-āyah
+SM-2 entries) rather than inventing new grading — the paper's whole premise
+is that this is "mostly a UI and labeling problem, not a new backend".
+
+New, DONE and verified live in-browser (npm run typecheck clean, screenshots
++ localStorage checks confirm real end-to-end behavior, not just rendering):
+- app/src/lib/tiers.ts — surahTier/isRetained/memorizedRatio/pagesForSurah,
+  pure functions deriving §05's tiers straight from existing
+  MemorizationEntry data + the real 604-row `pages` table (no new metric).
+- app/src/hooks/useActiveSlate.ts — §06's 6-slot active slate: claimSlot,
+  stepBack (+ 72h cooldown), releaseRetained/pruneRetained (instant, no
+  cooldown, for reaching Retained). Hit and fixed a real bug during
+  verification: claimSlot originally computed its synchronous return value
+  from a variable mutated inside the setState updater, which React doesn't
+  guarantee runs before the updater's caller sees the return — a caller that
+  claims a slot then immediately navigates (exactly what Sūrah Detail's
+  "Recite now" does) would sometimes see a stale `false` even though the
+  claim went on to succeed. Worse, the ORIGINAL persistence pattern (a
+  `useEffect(() => localStorage.setItem(...), [state])` keyed on the
+  component's own render) could lose the write entirely if that same
+  claim-then-navigate unmounts the component before the effect's commit —
+  confirmed live (claim would succeed transiently but localStorage stayed
+  `{"active":[],"cooldowns":[]}` after navigating to Practice). Fixed by
+  computing claimSlot's decision off the current render's `state` directly
+  (not the updater's `s` param) and having every mutator persist to
+  localStorage synchronously at the point of mutation, not via a delayed
+  effect. Lesson for any future localStorage-backed hook whose mutators are
+  called right before a navigation: persist synchronously, don't rely on a
+  post-commit effect.
+- app/src/hooks/useStreak.ts — §06 streak + joker (local-date based, 1 joker
+  per 7-day streak, cap 2, auto-bridges a single missed day if a joker is
+  available). Wired into the two real completion points that exist today:
+  Practice.tsx's per-āyah recordReview call and Review.tsx's pass branch.
+- app/src/screens/Journey.tsx — replaces Home.tsx (deleted, was only
+  referenced from App.tsx). Winding trail of all 114 sūrahs: a programmatic
+  zigzag layout + straight-segment SVG polyline connector (chosen over a
+  hand-authored bezier through 114 points — same "winding path" visual, far
+  more robust to get right on the first pass for every sūrah count). Node
+  size scales with āyah count (sqrt-scaled off Al-Baqara as the max). Status
+  bar shows the streak lantern + active-slate dots. Verified live: fresh
+  state renders all-not_started/0-6 active; claiming a slot on Sūrah 2
+  correctly flips its node to the "active" emerald-filled style and the
+  status bar to "1/6 active" after navigating away and back.
+- app/src/screens/SurahDetail.tsx (/surah/:id) — memorization ring (reuses
+  lib/tiers' mastered-ratio, same signal Memorization.tsx already showed as
+  a bar), real page count via lib/tiers' pagesForSurah (verified live: Sūrah
+  2 correctly shows "48 pages"), ayah dot row, due/next-review stats,
+  "Recite now" (claims a slot if needed, then routes into the real, existing
+  Practice.tsx — no new grading UI), and the §06 step-back action (behind
+  window.confirm, only shown while active and not yet Retained).
+- app/src/screens/DueForRework.tsx (/due) and Streak.tsx (/streak) — §04.6
+  and §04.7. Due for Rework groups the same due-filter Review.tsx already
+  uses, by sūrah, with a 3-way urgency badge (urgent = streak just reset to
+  0 i.e. last attempt failed; routine = status already mastered/reviewing;
+  due = everything else) — rows link into the existing Review.tsx rather
+  than a new scoped-recitation flow (see deferred items below). Streak.tsx
+  is a plain read-out of useStreak (week strip + joker shields).
+- BottomNav relabeled: Home->Journey (🗺), Reciters->Review (🔁, points at
+  /due) since Reciters is still reachable from Reader.tsx's reciter link.
+
+KNOWN SIMPLIFICATIONS vs. the design paper (flagged deliberately, not
+hidden — the paper's own §08 leaves several of these as open questions):
+- §05's 4-tier model (Not started/Heard/Recited/Retained) is collapsed to 3
+  (not_started/active/retained) here — there's no "Heard" instrumentation
+  yet since Listen & Repeat (§04.3) isn't built, so Tiers 1-2 can't be told
+  apart. lib/tiers.ts's surahTier is written to slot a real Heard signal in
+  later without changing its call sites.
+- §08 Q8 ("does Recite now claim a slot immediately, or only after a real
+  attempt") is resolved the simple way for now: SurahDetail's goRecite()
+  claims the slot on tap, before Practice even opens, rather than waiting
+  for a real accuracy result to come back. Revisit once Listen & Repeat
+  exists and there's a natural "this was a genuine attempt" signal to gate
+  on instead.
+- Due for Rework's rows all link to the same /review (reviews everything
+  due at once) rather than a per-row scoped session — Review.tsx has no
+  concept of "just this sūrah's due items" yet.
+
+NOT built this pass (large enough to warrant their own focused pass, tracked
+as separate tasks): Listen & Repeat's 4-stage guided flow (§04.3 — needs
+reciter-audio playback wired to a new stage state machine) and Session
+Summary (§04.5 — depends on Listen & Repeat existing to have something to
+summarize).
+
+-------------------------------------------------------------------------------
+PHASE 6 follow-up (same day) — Juz' navigation fix, a real map-state bug, and
+the two remaining screens (Listen & Repeat, Session Summary)
+-------------------------------------------------------------------------------
+User feedback: tapping a Juz' pill should open that Juz's sūrah, not just
+scroll the map. Fixed — Journey.tsx's JuzStrip is now a <Link to={`/surah/
+${start_surah}`}> instead of a scrollIntoView button. Verified live: Juz' 5
+correctly opens An-Nisāʾ's detail page with real data (176 āyahs, 30 pages).
+
+Then did a proper verification pass with SEEDED real data (not just the
+empty-state screenshots from the first build), which caught a second real
+bug: MapNodeView's `openToStart`/`locked` logic gated on `tier ===
+"not_started"`, so a sūrah with genuine partial progress (tier="active") that
+wasn't currently claimed in the slate — e.g. right after stepping back —
+rendered with the grey "locked" style even with slots wide open, instead of
+reading as available-to-resume. Root cause: conflating the data-driven tier
+with slate membership. Fixed by making availability purely a slate question
+(`!active && slotsOpen > 0` / `!active && slotsOpen <= 0`, tier only special-
+cased for "retained"). Verified live: seeded Al-Baqara with 30/286 mastered
++ 10 in-progress āyahs, stepped it back, confirmed it now shows as available
+(emerald outline) rather than locked; separately verified the genuinely-full
+case (6/6 active) correctly locks a 7th sūrah with a "Slots full" badge.
+
+Built the two deferred screens:
+- app/src/screens/ListenRepeat.tsx (/listen/:surah) — the §04.3 4-stage flow
+  (Listen -> Echo -> Recall -> Blind), per-āyah. Listen plays the āyah via
+  the existing PlayerContext + ayah_audio; Echo/Recall/Blind all reuse
+  useAutoRecorder + gradeClip (paragraph-mode, nearAyah-hinted) exactly like
+  Practice.tsx/Review.tsx — no new grading logic. Recall gates on a clean
+  pass to advance; Blind needs BLIND_STREAK_TARGET=2 consecutive clean
+  passes (§05 Tier 2's bar), and — a real addition beyond the spec's literal
+  text but in its spirit ("guide toward best performance") — drops back to
+  Recall after FALLBACK_AFTER_FAILS=3 failed Blind attempts in a row rather
+  than looping forever, matching §05's own "fell back to Recall/Echo
+  mid-way" quality-2 case. Quality scored per §05's second table (0 fails =
+  5, 1-2 fails = 4, 3+/fell-back = 2) and fed into the same recordReview +
+  streak.recordActivity() as every other real completion. Claims an
+  active-slate slot on entry, same as Sūrah Detail's "Recite now", blocked
+  with the same message if the slate is full (verified live).
+- app/src/components/SessionSummary.tsx — the §04.5 illumination ring +
+  confirmed/needs-work/streak summary, built as a reusable component (not
+  inline JSX) so Practice.tsx's own completion state can adopt it later.
+  ListenRepeat renders it once every āyah in the sūrah clears Blind.
+  Verified live via the accessibility snapshot (screenshot tool briefly
+  flaked, unrelated to the app) with temp-forced state: ring %, confirmed=5,
+  needsWork=2, streak, and both CTAs all rendered correctly; temp code
+  reverted after.
+
+Also caught and fixed, while wiring ListenRepeat: it had called
+useMemorization() TWICE (once destructuring `entries`, once as `memorization`
+for recordReview) — two independent useState instances that don't share
+state, so calling `memorization.recordReview(...)` would update one copy
+while the `entries` array used for startAyah/the summary ring's ratio stayed
+on its stale initial snapshot. Consolidated to a single call. Worth grepping
+for this pattern (`useMemorization()` called more than once in the same
+component) if it ever recurs elsewhere.
+
+All of §09's screens are now built: Journey Map, Sūrah Detail, Listen &
+Repeat, Practice (pre-existing), Session Summary, Due for Rework, Streak &
+Jokers. `npm run typecheck` clean throughout. Known gap: Echo/Recall/Blind's
+actual mic-grading path (as opposed to the stage-transition UI, which IS
+verified) can't be exercised in this dev sandbox — same pre-existing
+limitation noted for Practice/Review in earlier phases; needs a real-mic
+pass by the user before calling Listen & Repeat's grading behavior trustworthy.
+
+-------------------------------------------------------------------------------
+PHASE 6 follow-up #2 — local audio server, Echo stage didn't actually verify
+-------------------------------------------------------------------------------
+"Play this āyah" produced no sound with no error. Root cause: not a code bug
+— VITE_AUDIO_BASE_URL points to http://localhost:8080, a local static file
+server for Data/audio that simply wasn't running (server/run.ps1's
+correction API and this are two SEPARATE local servers). Started it
+(`python -m http.server 8080` from the project root, NOT the `Data`
+subfolder — audio_path is stored as `data/audio/ayahs/...` and Windows'
+case-insensitive filesystem only resolves that against `Data/` one level up
+from repo root). Verified live via the network log: the exact request that
+had failed with ERR_CONNECTION_REFUSED succeeded with 200 OK once the server
+was up. This local server isn't persistent infrastructure — it needs
+restarting the same way after a machine reboot or session end.
+
+While fixing that, also improved real silent-failure UX gap it exposed:
+PlayerContext previously swallowed playback failures entirely (both a
+rejected play() promise and the <audio> element's native error event were
+uncaught) — now exposes `error: string | null`, surfaced in Listen & Repeat
+next to the Play button. Also added a message for the (different) case of a
+reciter genuinely having no recording for a given āyah, which previously was
+also a silent no-op.
+
+User feedback: Echo's mistake-checking didn't actually verify anything —
+gradeClip() was called and the result stored in `report`, so the colored
+GradedAyah feedback DID render, but the stage transition ignored the result
+completely (`if (stage === "echo") { return; }`, paired with an always-
+visible "Next: Recall" link) — a mistake in Echo was checked but never
+acted on. Fixed: Echo now gates exactly like Recall/Blind (auto-advances
+to Recall only on a clean pass via gradeClip/`clean()`), and the free-skip
+link is gone. All three recording stages now consistently require a correct
+recitation to progress — verified live that Echo's UI no longer offers a
+way past a stage without reciting into it (mic-grading correctness itself is
+still subject to the same real-mic verification gap noted above).
+
+User feedback (real-mic testing): "recite correctly, then stay silent — after
+a moment it says wrong." Real, correctly-diagnosed-by-the-user bug (not a
+grading-model problem): `useAutoRecorder`'s single instance is created once
+for the whole ListenRepeat session and never stopped on a pass — only the
+STAGE changes (via a delayed setStage()), the mic keeps recording straight
+through. The reciter goes quiet after finishing correctly, but the recorder
+doesn't; eventually background noise (or the mic's own noise floor) trips
+`pauseDetector.ts`'s speech threshold again, cutting a near-silent trailing
+segment. That segment gets sent to gradeClip, correctly comes back as not
+matching (there's no real recitation in it), and `handleSegment` unconditionally
+does `setReport(rep)` before checking pass/fail — so this bogus result
+overwrites the correct ✅ with a false "Not quite", and can even bleed into
+the NEXT stage if the stage transition has already fired by the time it lands.
+Fixed: every pass branch (Echo, Recall, Blind's 2nd clean streak, and the
+Blind fallback-to-Recall path) now calls `autoRec.stop()` SYNCHRONOUSLY at
+the moment the pass is detected, before scheduling the delayed stage change
+— not just relying on the eventual setStage(). Each new stage requires an
+explicit "Start reciting" tap, same as entering a stage does today; this is
+a deliberate trade (one extra tap per stage) for eliminating the whole bug
+class rather than trying to tune the pause detector's threshold, which
+wouldn't fix it (the detector is working as designed — the bug was that
+nothing ever told it to stop). Still needs the user's real-mic pass to
+confirm no more false negatives.
+
+User feedback (real-mic testing, immediately after the fix above): "Not
+quite" even when reciting correctly. Second, different real bug, this time
+in the pass CRITERION itself. `clean()` in ListenRepeat.tsx (the Recall/Blind
+gate) required EVERY word tagged to the āyah to come back `content_ok` —
+built fresh for this screen instead of reusing Practice.tsx's already
+real-audio-validated PASS_RATIO=0.5 threshold (majority of words content_ok,
+clip covers ~all expected words). A handful of individual words routinely
+misfire on the ASR even for a genuinely correct recitation — Practice.tsx
+already learned this the hard way (see its own PASS_RATIO comment and the
+Phase 0 CER-threshold validation notes above) — so a 100%-of-words bar was
+guaranteed to false-negative in normal use, not just an edge case. Fixed:
+`clean()` now takes the āyah's expected word count and uses the exact same
+completeness + PASS_RATIO check as Practice.tsx, still content_ok-based (not
+Practice's tajweed-inclusive `verdict`, since Recall/Blind are specifically
+checking memorized content, not pronunciation). Lesson for next time: when a
+new screen needs a "did they get it right" check and an existing, real-audio
+proven one already exists elsewhere in the app, reuse its exact threshold
+rather than inventing a fresh, untested one — this is the second bug in this
+screen alone from not doing that.
+
+User feedback (real-mic testing, same session): "the second time to recite
+[in Blind] is not working." Third bug, same root cause as the very first one
+(recorder not stopping on a pass) — just missed in one spot when applying
+that fix. Blind needs BLIND_STREAK_TARGET=2 consecutive clean passes; the
+`autoRec.stop()` fix was applied when the 2nd clean pass hits target, but NOT
+on the 1st clean pass while waiting for the 2nd — the recorder kept
+listening through the gap between attempt 1 and attempt 2. Same failure mode
+as before: reciter pauses to collect themselves after a correct 1st attempt,
+mic stays hot, a trailing-silence segment eventually gets cut and graded,
+fails, and the `else` branch's `setBlindStreak(0)` silently resets the
+streak back to 0 — before the reciter even gets to attempt the 2nd
+recitation. From the outside this reads exactly as "the second recitation
+isn't working," since the streak can never survive the gap between attempts
+regardless of how well the reciter actually does. Fixed: `autoRec.stop()`
+now runs on EVERY blind pass, not just the one reaching target — the 2nd
+attempt now requires its own explicit "Start reciting" tap, consistent with
+every other stage transition in this screen. Worth noting for future
+review of this file: "stop the recorder on every code path that can be
+followed by silence" is the actual invariant this screen needs, not
+"stop the recorder when transitioning stages" — those aren't quite the same
+thing, as this exact miss demonstrates, and it's worth re-scanning
+handleSegment once more for any other pass-then-continue-listening path
+that might still be exposed to it.
+
+Did that re-scan immediately (same session). Found one more, quieter
+instance: on a genuine FAIL (any stage, below FALLBACK_AFTER_FAILS), the
+recorder deliberately keeps listening so the reciter can retry without an
+extra tap — but that means the exact same trailing-silence risk applies to
+the gap between a failed attempt and the retry: a near-silent segment could
+get graded, come back as "not passed" again, and increment blindFails purely
+from noise (inflating the fail count toward a premature fallback-to-Recall,
+or just a confusing extra "Not quite" for something the reciter never said).
+Rather than adding autoRec.stop() to every fail branch too (which would cost
+an extra tap on every single retry — real UX friction for the common case),
+fixed this with a general guard instead: `handleSegment` now discards any
+segment whose `decoded_text` is under 3 characters BEFORE touching report,
+streak, or fail-count state at all — genuinely not a real attempt, not "a
+wrong one." This also acts as defense-in-depth for the pass-side fixes
+above, in case the `autoRec.stop()` call ever loses the race against a
+faster-than-usual ambient noise blip (cut happens, new segment starts, noise
+trips it before grading of the PASSING clip has resolved and called stop()).
+
+User feedback (real-mic testing, same session, screenshot): Recall showed
+✅ "Correct." for a genuinely correct recitation — the frontend fixes above
+ARE working — but a raw backend error ALSO appeared underneath it: "Échec de
+l'analyse audio : ... targets length is too long for CTC. Found log_probs
+length: 65, targets length: 120, and number of repeats: 4". Real backend
+bug, first one found in this whole Listen & Repeat investigation that isn't
+a frontend/recorder issue. Root cause: torchaudio's `forced_align` (called
+from `Wav2Vec2Aligner.align_from_decode`, `src/tajweed/correction/
+aligner.py`) has a hard CTC constraint — the target token sequence (with
+mandatory blanks between consecutive repeated tokens) must fit within the
+emission's frame count, or it raises RuntimeError. `evaluate_clip` (`src/
+tajweed/correction/evaluate.py`) bounds the candidate text to
+`locate_best_span`'s matched [ayah_from, ayah_to] range before force-
+aligning, same as always — but the frontend guards added earlier in this
+session only close the gap AFTER a segment has already been cut and is
+in-flight being graded; they don't retroactively cancel a segment that was
+cut and started grading concurrently, before `autoRec.stop()` had a chance
+to land (grading is async and takes real wall-clock time, while the
+pause-detector's cutting loop runs independently in the background — see the
+two frontend fixes just above for the fuller mechanics). So a short/
+near-silent stray segment could still occasionally reach the server, get
+matched by `locate_best_span` against a candidate span too long for its
+actual (short) audio, and crash `forced_align` instead of gracefully
+mismatching. `server/app.py` already wraps evaluate_clip in a bare `except
+Exception` -> `HTTPException(422, f"Échec de l'analyse audio : {e}")`, so
+the raw torchaudio C++ error message was surfacing verbatim to the end user,
+confusingly right next to a correct ✅ for the actual real recitation.
+
+Fixed at the source rather than papering over it client-side: `evaluate_clip`
+now wraps the `align_from_decode` call in a try/except matching specifically
+on "targets length"/"CTC" in the RuntimeError's message (not swallowing
+every RuntimeError — a different, genuine bug should still surface loudly),
+and on that specific match returns a normal `located=False` /
+`content_status="content_mismatch"` ClipReport — the semantically correct
+read of this failure: locate_best_span's matched span simply doesn't fit
+what's actually in the clip, same as any other bad match, not a hard error.
+Added 3 regression tests in tests/test_correction.py (a fake aligner whose
+align_from_decode raises the real CTC error message; confirms it now reads
+as not-located; a second fake aligner raising an UNRELATED RuntimeError,
+confirming that one still propagates and isn't accidentally swallowed by the
+same catch). `python -m pytest tests/test_correction.py`: 54 passed, 1
+failed — the 1 failure (test_evaluate_clip_locates_and_grades_without_
+start_ayah) is pre-existing and unrelated (a locate_best_span tie-break
+case, not touched by this change).
+
+IMPORTANT: server/run.ps1 runs uvicorn WITHOUT --reload, so this fix needs
+the correction server manually restarted (Ctrl+C, re-run server/run.ps1)
+before it takes effect — confirmed still running the old code as of this
+fix (health check responded, meaning the process is up but hasn't picked up
+the edited .py file).
+
+===============================================================================
+CROSS-CUTTING: performance & reliability (do continuously, not a "phase")
+===============================================================================
+- Model load time (~seconds today, confirmed fine) vs INFERENCE time per
+  request — measure this explicitly once Phase 0/1 land; CPU wav2vec2 on a
+  whole surah (many ayahs) could get slow. If it does:
+    * try ONNX-exporting the model (typically 2-4x CPU speedup, no accuracy
+      change) before reaching for a smaller/different model.
+    * only consider a distilled/smaller Arabic wav2vec2 if ONNX isn't enough.
+- Server reliability: today's session found the correction API dies silently
+  when launched as an ad-hoc background process from tooling — it must be
+  started by the user in their own terminal (`server/run.ps1`) and left
+  running. Before Phase 2 (long recording sessions) ships, consider a small
+  supervisor (a loop that restarts uvicorn if it dies) so a long practice
+  session doesn't get cut off mid-surah.
+- Trust regression set: as each phase lands, add a few real recordings to a
+  small fixture set (correct recitation, wrong-language speech, wrong-ayah
+  recitation, a deliberately-mispronounced word) and check the expected
+  verdict doesn't regress — same spirit as the 2026-07-03 injected-error
+  validation (scratchpad/validate_wrong.py), just kept as a standing check
+  instead of a one-off script.
+
+-------------------------------------------------------------------------------
+PHASE 6 follow-up #3 — real Juz' grouping + divider lines on the Journey Map
+-------------------------------------------------------------------------------
+User feedback: sūrahs on the Journey Map should be visually grouped by Juz',
+with a divider between groups, and tapping a Juz' pill should scroll to that
+section of the trail rather than navigating away (reverting the earlier
+follow-up #1 change, which sent Juz' taps straight to a sūrah's detail page
+— that turned out to be the wrong read of the original ask).
+
+Added `juzForSurahStart(surah, juzList)` (Journey.tsx): which Juz' contains
+a given sūrah's ĀYAH 1 — the last juz' (in reading order) whose start is at
+or before that āyah. Needed because a sūrah can SPAN several juz' (Al-Baqara
+covers 1-3) and a juz' can start MID-sūrah (Juz' 2 starts at 2:142, still
+within Al-Baqara) — naively using `juz.start_surah === surah` would miss
+most real boundaries. Verified against the actual `juz` table data (not just
+assumed): Juz' 4 starts at 3:93 (mid Aal-i-Imraan) and Juz' 5 at 4:24 (mid
+An-Nisā'), so neither aligns with a sūrah's own beginning and correctly
+produces NO divider — confirmed live that the rendered divider list is
+1,3,4,6,7,8,9,...,30 (skipping 2 and 5, exactly the two that don't align to
+any sūrah start). A `JuzDivider` (gold line + "Juz' N" pill, id=`juz-anchor-
+{n}`) renders at each transition, doubling as JuzStrip's scroll target
+(`scrollIntoView({block:"start"})` — a jump WITHIN the map now, not a
+navigation away from it) — verified live that tapping "Juz' 6" lands that
+exact divider at the top of the viewport. Added a subtle alternating
+background tint per juz' section (bg-brand-gold/5 on even-numbered juz') as
+the "color" half of the separation the user asked for, alongside the line.
+
+Also relabeled the earlier follow-up #1 comment in JuzStrip's docstring —
+it described the WRONG intended behavior (navigate away) as if it were the
+right one; now corrected to describe the scroll-within-the-map behavior
+this fix restored.
+
+-------------------------------------------------------------------------------
+PHASE 6 follow-up #4 — Juz' divider actually masked by its own node (geometry
+was wrong, not just tight)
+-------------------------------------------------------------------------------
+User feedback: "juzaa 29 is masked by surah al mulk". Confirmed via
+getBoundingClientRect() (not a screenshot guess) — the "Juz' 29" label was
+rendering ~6px INSIDE Al-Mulk's own circle, invisible under it since nodes
+paint after dividers in DOM order. A first attempt at bumping ROW_H/the
+divider offset (bullet above, PHASE 6 follow-up #3) turned out to still be
+wrong: it assumed a node's circle is centered at its own `y` coordinate, but
+`translate(-50%,-50%)` centers the WHOLE rendered block — circle PLUS its
+two-line name label below — and since there's nothing ABOVE the circle to
+balance the label's weight, the circle's true visual center sits ABOVE `y`
+by roughly half the label's height (~19px). Every clearance calculation
+built on "circle center = y" undershot by exactly that amount. Re-derived
+against LIVE MEASURED numbers this time (not just worked-out theory) and
+wrote an automated check — for each of the 30 Juz', get the divider's label
+pill's rect and every node's rect, and flag any real (not just "the divider's
+full-width connector line passes near a node", which is fine/expected)
+overlap. Iterated until that check came back clean for all 30 (only Juz' 2
+and 5 "missing", correctly — they don't align with any sūrah's start).
+Final numbers: DIVIDER_OFFSET=85 (was 60), DIVIDER_EXTRA_GAP=55 (was 40),
+initial node y=100 (was 70) so the very first divider (Juz' 1, over Al-
+Fātiḥa) doesn't go negative. The map is correspondingly a bit taller now (an
+extra ~15px per Juz' transition, ~28 transitions ≈ 420px total) — an
+acceptable trade for the dividers actually being visible, which is the
+entire point of them existing.
+
+Lesson worth carrying forward: for absolutely-positioned UI with a
+transform-based centering trick, "does the math work out" isn't enough
+verification for a claimed geometry fix — the FIRST attempt at follow-up #3
+looked correct on paper and still shipped broken. Live-measuring the actual
+rendered rects (getBoundingClientRect(), not eyeballing a screenshot) caught
+what the math missed, and is worth reaching for by default on any layout fix
+in this file involving manually-computed pixel offsets, not just as a
+last resort after a user reports it's still wrong.
+
+-------------------------------------------------------------------------------
+PHASE 6 follow-up #5 — Listen & Repeat: learner-chosen chunk size (1-3 āyahs)
+-------------------------------------------------------------------------------
+User feedback: "memorization can be with one ayah two or even three it's the
+choice of the learner" — Listen & Repeat was hardcoded to exactly one āyah
+per Listen/Echo/Recall/Blind cycle. Reworked app/src/screens/ListenRepeat.tsx
+from a single `ayah: number` to a `chunkStart`/`chunkEnd` RANGE, with a
+learner-facing "Āyahs at a time: 1 / 2 / 3" selector (localStorage-persisted
+preference, `sanad.listenRepeat.chunkSize`), only shown/editable during the
+Listen stage — changing it mid-Echo/Recall/Blind would be confusing since
+you're already committed to the current chunk.
+
+No new grading logic needed — this is exactly the "chaining" mechanism the
+design paper (§04.2) already described for a single āyah spilling into the
+next: gradeClip locates a range within the whole sūrah regardless of how
+many āyahs that range spans, so a 3-āyah chunk is graded as a single unit
+for free. The real work was generalizing every ayah-shaped piece of state to
+a chunk-shaped one:
+  - clean() now checks word_scores across [chunkStart, chunkEnd], not one
+    āyah — same PASS_RATIO/completeness logic, just a wider ayah filter.
+  - Display swapped from GradedAyah (single text + word_scores, offsets
+    relative to that one string) to GradedSurah (multiple verses + a
+    per-āyah word map, correctly re-bases each verse's own offsets) — it
+    already existed for Practice.tsx's whole-surah view and turned out to
+    be exactly the right component for a 1-3 āyah chunk too, no new
+    rendering code needed, just reused with cursorAyah=-1 (no highlight).
+  - playChunk() queues ALL of the chunk's audio tracks via the existing
+    PlayerContext (one player.play(tracks, 0) call) instead of one.
+  - finishChunk() calls recordReview once per āyah in the chunk (not once
+    total) so useMemorization's per-āyah SM-2 schedule stays accurate
+    regardless of chunk size, and Session Summary's confirmed/needsWork
+    counts increment by chunkAyahs.length so a 3-āyah pass reads as +3, not
+    +1 — undercounting would have made the ring/summary misleading for
+    anyone using chunk size >1.
+
+Verified live: chunk size persists across a reload; selecting 3 correctly
+shows Al-Baqara āyahs 1-3 as one flowing passage (right ayah-end ornaments,
+"Āyah 1–3 of 286" header) and the size selector correctly disappears once
+Echo starts. Real per-chunk grading on live audio still carries the same
+real-mic-verification caveat as the rest of this screen.
+
+PHASE 6 follow-up #6 — real login/signup page (Supabase Auth)
+-------------------------------------------------------------------------------
+User request: "let's make a cool login page." Resolves the open "Phase 4/5
+auth" decision below: went with real Supabase Auth (same project already used
+for reference-data reads, not a second project — Auth is a built-in feature
+of the same URL/anon key), OPTIONAL rather than gating, so all existing
+local-first features (memorization, streak, active slate) keep working exactly
+as before with zero account.
+
+New:
+  - state/AuthContext.tsx — mirrors the SettingsContext/PlayerContext pattern:
+    supabase.auth.getSession() on mount + onAuthStateChange subscription,
+    exposes { user, session, loading, signIn, signUp, signOut }. Wrapped
+    around <App/> in main.tsx (inside SettingsProvider, outside PlayerProvider
+    — no ordering dependency, just kept alongside the other app-wide providers).
+  - screens/Login.tsx — new standalone route, mounted OUTSIDE <Layout/> (no
+    bottom nav/mini-player chrome — a login screen isn't part of the tab flow).
+    Sign-in/sign-up segmented toggle, on-brand (emerald/gold/cream, Amiri
+    Quran wordmark, ambient blur glows), a "Continue without an account" link
+    back to "/", and a footer line clarifying local progress isn't lost
+    either way. Redirects to `location.state.from` (or "/") on success so a
+    future "sign in to continue" redirect flow has a landing spot.
+  - Settings.tsx — new "Account" group at the top: shows email + "Sign out"
+    when signed in, otherwise a "Sign in" link to /login. This is the only
+    integration point into the existing app; nothing else changed.
+
+Verified live: /login renders correctly in both light and dark
+(prefers-color-scheme, matching the app's existing "system" theme handling);
+sign-in/sign-up toggle switches copy and button label; a real sign-up submit
+round-tripped to Supabase (POST .../auth/v1/signup), confirming the anon key
++ project wiring is live — Supabase itself rejected the `@example.com` test
+address (expected, its own email validator) and the exact message surfaced
+in the form, proving errors propagate correctly end-to-end. Settings → "Sign
+in" link navigates to /login via react-router. Did not complete a real
+sign-up (would email a real inbox) — wiring is confirmed via the above.
+
+PHASE 6 follow-up #7 — app renamed Tartīl → Sanad
+-------------------------------------------------------------------------------
+User request: "let's change the name of the app because it's already taken and
+I want something better and memorable." Picked Sanad (سَنَد — the traditional
+"chain of transmission" that certifies a reciter learned correctly from a
+verified teacher), over three other candidates offered (Talaqqi, Sadā,
+Miqra'/Ratlan/Tikrar/Rawi/Lisan across two rounds) — a strong fit since the
+whole app IS that verification loop (listen, repeat, get corrected).
+
+Renamed everywhere the old name was user-facing or a real identifier:
+  - app/index.html <title>, app/package.json + package-lock.json "name",
+    server/app.py's FastAPI title, .claude/launch.json's server name.
+  - UI text: Login.tsx wordmark + heading, Journey.tsx header, Settings.tsx
+    "About" row — Arabic تَرْتِيل → سَنَد, Latin "Tartīl" → "Sanad" throughout.
+  - ALL localStorage key prefixes (tartil.* → sanad.*) in SettingsContext,
+    useActiveSlate, useStreak, useMemorization, useBookmarks, lastRead, and
+    ListenRepeat's chunk-size preference — a clean break, not a migration:
+    this is still pre-launch/dev-only data, so old tartil.* keys are simply
+    orphaned in any browser that already had them rather than migrated,
+    which would've been speculative engineering for data nobody depends on.
+  - docs/README.md, PRD.md, SCREENS.md, STITCH_PROMPT.md,
+    CLAUDE_DESIGN_IDENTITY_PROMPT.md, and this roadmap's own title line.
+
+Deliberately did NOT touch: Data/raw/quran-uthmani.txt or
+Data/audio/data/quran_.json's "tartīlan" hits — those are the real Qur'anic
+word (Q25:32, Q73:4) appearing in transliterated scripture text, not app
+branding; and did not rewrite the historical "Tartīl — The Guided Recitation
+Journey" design-paper reference further up this file (2026-07-09 entry) —
+that accurately records what the paper was called at the time, rewriting it
+would falsify the log rather than just rename the product.
+
+Verified: typecheck clean; live in the browser — Login/Journey/Settings all
+show "Sanad"/سَنَد correctly in both themes, no leftover "Tartīl" in rendered UI.
+
+PHASE 6 follow-up #8 — accounts made mandatory; streak/progress moved server-side
+-------------------------------------------------------------------------------
+User: "you can't continue without account because you need it to track the
+streak and progression." Reverses follow-up #6's "optional" call — correctly:
+localStorage-only progress was never going to survive "tied to your account"
+in any meaningful sense. This is the migration flagged as the open question
+at the bottom of #6.
+
+New tables in schema.sql (user must run this block in the Supabase SQL editor
+— I have the anon/service_role REST keys, not a raw Postgres connection, so I
+cannot execute DDL myself the way the SQL editor can):
+  - user_memorization (user_id, surah, ayah) — mirrors MemorizationEntry.
+  - user_streak (user_id) — mirrors StreakState.
+  - user_active_slate (user_id) — mirrors ActiveSlateState, active/cooldowns
+    kept as jsonb arrays (always read/written whole, never queried by field).
+  All three: RLS enabled, one policy set restricting select/insert/update to
+  auth.uid() = user_id — a user can only ever see or write their own row.
+
+Rewrote all three hooks (useMemorization, useStreak, useActiveSlate) from
+localStorage load()/persist() to React Query (matching useQueries.ts's
+existing pattern) + Supabase upserts, keyed on useAuth().user.id. Kept the
+exact same return shape each screen already consumes (entries/get/
+recordReview, {...streak state}/recordActivity, active/isActive/claimSlot/
+etc.) plus an added `loading` flag — zero changes needed in the 8 screens
+that call them. useActiveSlate.claimSlot keeps its "returns synchronously,
+safe to navigate() right after" contract from follow-up's original design
+(§06) by updating the React Query CACHE synchronously via
+queryClient.setQueryData before firing the Supabase upsert in the
+background — the network round trip no longer blocks the caller.
+
+New components/RequireAuth.tsx gates every route except /login behind
+useAuth().user — redirects to /login (remembering the attempted path via
+router state) while auth is resolving it shows a spinner, not a flash of the
+app. Login.tsx's "Continue without an account" escape hatch removed (no
+longer a real option); copy updated to state plainly that an account is
+required for streak/progress. Settings' Account section simplified — the
+"no account yet" branch is now dead code (you can't reach Settings without
+one) so it was deleted, not just left unreachable.
+
+Deliberately did NOT move: bookmarks, last-read position, or the settings
+themselves (theme/font/reciter/tajweed toggle) — user only asked about
+streak and progression; those three stay device-local localStorage, no
+reason to force a network round trip for pure UI/device preference.
+
+Clean cutover, not a migration: any pre-existing local-only sanad.streak /
+sanad.memorization / sanad.activeSlate data (this session's own test data)
+is simply orphaned, not imported — same call as follow-up #7's rename,
+consistent for the same reason (pre-launch, nothing real depends on it yet).
+
+Verified: typecheck clean; live in the browser, visiting "/" while signed
+out cleanly redirects to "/login" (RequireAuth works), Login's skip link is
+gone. Did NOT verify the actual Supabase writes round-trip yet — that needs
+(1) the user to run the new schema.sql block in the SQL editor, since I
+can't execute DDL, and (2) a real sign-up with a real inbox to confirm (the
+earlier example.com test address was rejected by Supabase's own validator,
+by design — not something I can fake around). Until the SQL is run, the
+hooks fail closed: a failed table lookup just logs to console and the query
+falls back to EMPTY state, so the app still functions but nothing persists.
+
+PHASE 6 follow-up #9 — Google sign-in
+-------------------------------------------------------------------------------
+User: "make it can log in with gmail." Added Supabase's OAuth flow for Google
+alongside the existing email/password form (not a replacement — both stay).
+
+AuthContext.tsx: new `signInWithGoogle()` calling
+`supabase.auth.signInWithOAuth({ provider: "google", redirectTo:
+window.location.origin })`. This is a full-page redirect to Google and back,
+not a promise that resolves with a result — Supabase's client auto-parses the
+tokens out of the return URL (detectSessionInUrl, on by default) and the
+existing onAuthStateChange listener picks up the resulting session the same
+as it already does for email/password, so no separate callback route or
+extra AuthContext plumbing was needed.
+
+Login.tsx: "Continue with Google" button (brand-mark SVG, Google's 4-color G
+— not tinted to the app's emerald/gold, deliberately neutral per how Google
+expects its mark treated) above an "or" divider over the existing form. Reads
+`?error_description=`/`?error=` off the URL on mount, since a failed OAuth
+attempt (denied consent, misconfigured provider) bounces back to redirectTo
+with the failure in the query string and there's no other channel to learn
+about it after a full navigation away and back.
+
+NOT done, and can't be from here — needs the user's own Google Cloud +
+Supabase dashboard access, not something available via the REST/anon keys
+this project has:
+  1. Google Cloud Console: create an OAuth 2.0 Client ID (web application),
+     add authorized redirect URI = https://<project-ref>.supabase.co/auth/v1/callback.
+  2. Supabase dashboard -> Authentication -> Providers -> Google: enable,
+     paste the Client ID + Client Secret from step 1.
+Until that's done, clicking the button will fail (Supabase returns an error
+before ever reaching Google) — the button itself is fully wired and will
+start working the moment the provider is enabled, no code changes needed.
+
+Verified: typecheck clean; button renders correctly light/dark, sign-in/
+sign-up toggle unaffected, no console errors after a clean reload (some
+transient hook-order warnings appeared DURING the edit itself — a known
+Vite Fast-Refresh limitation when a file exports both a component and a
+hook, same shape AuthContext/SettingsContext/PlayerContext already have;
+confirmed cosmetic via full reload, not a real bug, not touched further).
+
+Same-day update: user can't do the Google Cloud Console step right now (needs
+a credit card to verify the Google Cloud account, doesn't have one handy) —
+"we skip this part." Rather than leave a button visible that errors on every
+click with no ETA on being fixed, gated it behind a new
+`VITE_GOOGLE_AUTH_ENABLED` env flag (screens/Login.tsx, default false/unset)
+— hides the button + its "or" divider entirely, email/password unaffected.
+All the OAuth code (AuthContext.signInWithGoogle, the button, the error-from-
+URL handling) stays exactly as built; flipping the flag to `true` in
+.env.local after the Google Cloud + Supabase dashboard setup is the entire
+remaining step, no further code changes. Documented in .env.example.
+
+PHASE 6 follow-up #10 — overnight autonomous audit + hardening pass (2026-07-11)
+-------------------------------------------------------------------------------
+User (going to sleep): "analyze the app and see what needs to upgrade and
+reshape for a better result. I want an auto evaluation for a top app that
+will be used by a lot of people… don't ask anything… upgrade until the
+tokens are over." Full evaluation written to docs/AUDIT_2026-07-11.md
+(scorecard + prioritized backlog); fixes shipped tonight, in order found:
+
+1. REAL BUG — stale-closure compounding in all three progress hooks
+   (useMemorization.recordReview, useStreak.recordActivity, every
+   useActiveSlate mutator): they computed "next" from the RENDER closure's
+   state, but callers fire in bursts (finishChunk loops recordReview over a
+   whole chunk; timers fire long after their capturing render), so each call
+   could compound onto stale state and silently lose increments. All mutators
+   now read the live React Query cache (setQueryData functional updater /
+   getQueryData) at call time. This also restored the localStorage-era
+   functional-setState discipline the Supabase rewrite (#8) had dropped.
+2. components/ErrorBoundary.tsx — app previously white-screened on any render
+   error. Fallback uses inline styles only (can't be taken down by a broken
+   CSS layer), wraps everything in main.tsx.
+3. Silent-persistence trap — if schema.sql's user_* tables were never run,
+   the app looked fine while saving NOTHING. useMemorization now exposes
+   syncBroken (initial select failed) and Layout shows a red banner naming
+   the exact fix. This is also tomorrow-morning's first check for the user.
+4. Bundle: was ONE 521 kB chunk (Vite's own build warning). All 16 non-landing
+   screens now React.lazy (App.tsx), nested Suspense inside Layout so the
+   nav/mini-player shell doesn't flash away on first visit to a lazy screen,
+   and vite.config.ts pins react/supabase/query vendor chunks — app chunk is
+   now 39 kB; an app-code change no longer busts the 400+ kB vendor cache.
+5. Forgot-password flow — mandatory accounts (#8) with NO recovery meant a
+   forgotten password permanently orphaned all progress. AuthContext gained
+   resetPassword/updatePassword; Login gained "Forgot password?" (sign-in
+   mode); new standalone /reset-password screen (outside RequireAuth, shows
+   an expired-link notice when arriving without a recovery session).
+6. index.html: SVG favicon (gold concentric silsila rings on emerald — the
+   "chain" of Sanad) + meta description. BrowserRouter v7 future flags
+   (startTransition/relativeSplatPath) — the two console warnings gone.
+7. Journey no longer flashes all-not_started before progress loads (gates on
+   memorization+slate loading, not just the sūrah list).
+8. app/README.md rewritten (was 3 renames stale: old screens list, old
+   localStorage story, no auth section, no user_* tables).
+
+Verified: typecheck + production build clean after each step; live browser:
+signed-out redirect, forgot-password link, hidden Google button, lazy
+/reset-password renders with expired-link guard, zero console errors.
+NOT verifiable alone: signed-in flows (needs the user's real inbox) and
+user_* table writes (needs schema.sql run) — both now fail LOUDLY instead of
+silently, which was the point of #3.
+
+Round 2 (same night, continued until token budget):
+9.  Tap targets: Practice/Review āyah dots were 10px bare buttons — now a
+    28px padded hit area around the same 10px visual dot (negative margin
+    keeps the strip dense), plus aria-labels.
+10. Practice's on-screen debug log gated behind import.meta.env.DEV — dev
+    server (where mic testing happens) still shows it, production never.
+11. PWA installability: public/manifest.webmanifest + public/icon.svg
+    (favicon moved there from a data URI) + apple-touch-icon. Deliberately
+    NO service worker yet — offline caching bugs are riskier than the win.
+12. Login now redirects already-signed-in visitors to their destination
+    (bookmark to /login, back-button after auth, OAuth round-trip landing).
+13. Crash telemetry: lib/errorReporting.ts (swallow-all, 5/page-load cap,
+    dedupe) wired into ErrorBoundary + window.onerror/unhandledrejection;
+    new client_errors table in schema.sql (RLS: authenticated insert-only,
+    read from the dashboard). Errors real users hit are now visible.
+14. LOADING-FLASH BUG CLASS (entries went async in #8, screens still assumed
+    sync-localStorage): ListenRepeat could seed chunkStart from the
+    not-yet-loaded EMPTY entries and lock the session onto āyah 1 for a
+    learner who'd mastered 1-10 (real bug, not cosmetic — now waits for
+    memLoading); Review + DueForRework flashed "🎉 Nothing due" while the
+    due list was still loading; SurahDetail flashed a 0% ring. All gated.
+15. BACKEND REGRESSION caught by running the full suite (it had NOT been
+    re-run since follow-up #46's suffix-fit change): locate_best_span let a
+    SUPERSET window tie a tight one at identical CER (suffix-fit's free
+    leading gap absorbs the extra āyah at zero cost = zero evidence it was
+    recited), and min() picked the wider span — systematically inflating
+    ayah_from. Fixed in content_check.py by pruning any window dominated by
+    an equal-scoring strict sub-window, BEFORE the near_ayah tie-break (a
+    superset must never win even when its ayah_from sits closer to
+    near_ayah). test_evaluate_clip_locates_and_grades_without_start_ayah
+    passes again + new regression test for the near_ayah variant. 56/56
+    pass (pytest itself had to be reinstalled into .venv — it was missing,
+    which is HOW the suite silently went stale). Correction server needs
+    its usual manual restart to pick this up.
+
+Round 3 (same night):
+16. Loading-flash sweep completed across the remaining progress screens:
+    Memorization ("No recitations tracked yet"), Streak ("0 days lit"), and
+    Journey's header lantern (shows "–" while loading, never a lying "0").
+17. Settings gained an inline "Change email" row (AuthContext.updateEmail →
+    supabase.auth.updateUser({email}); confirmation links go to BOTH
+    addresses, copy says so). Delete-account remains open — it needs a
+    service-role edge function, can't be done from the client.
+
+Audit findings deliberately NOT auto-fixed (product decisions, listed in
+AUDIT doc): Practice records progress without claiming a slate slot while
+ListenRepeat claims+blocks (inconsistent story, needs a call); service
+worker/offline; account deletion; i18n (Arabic/French).
+
+PHASE 6 follow-up #11 — memorization % that moves + recite-from-memory reveal
+-------------------------------------------------------------------------------
+User: "make the percentage work for both listen and repeat and recite now
+when clicking a surah in the roadmap… and when 'recite now' at first the
+words of the surah must be transparent and while I'm reciting it shows the
+words."
+
+DIAGNOSIS of "percentage doesn't work": it wasn't a per-flow bug — both
+Practice (Recite-now) and ListenRepeat already call
+useMemorization.recordReview, feeding the SAME table. The metric itself was
+the problem: lib/tiers.ts memorizedRatio counted ONLY "mastered" āyahs
+(streak >= 7), so a full, correct recitation from either flow left every āyah
+at "learning" and the ring stayed flat at 0% — looked broken. Fix: made
+memorizedRatio GRADED (status-weighted: learning 0.34 / reviewing 0.67 /
+mastered 1.0), summed over the āyah count. Now one correct pass of a sūrah
+reads ~34%, reviewing ~67%, fully mastered exactly 100% (so it still agrees
+with isRetained at the top). Verified the arithmetic with a standalone node
+check (0→34→67→100). Same graded ring now also drives ListenRepeat's
+SessionSummary and Sūrah Detail — both flows visibly move it.
+
+Also surfaced a LIVE memorized-% bar on Practice itself (climbs as
+recordReview lands mid-session) so "Recite now" shows the percentage working
+in real time, not just on Sūrah Detail.
+
+Recite-from-memory reveal: GradedSurah gained a `hideUngraded` prop —
+ungraded words render `color: transparent` (invisible but their glyph box is
+preserved, so NOTHING reflows as words appear) with `select-none` so the
+hidden text can't be copy-peeked; graded words show in their green/red
+verdict color. Practice defaults to hidden (resets to hidden on every sūrah
+change), reveals each word as it's recited, and has a "👁 Reveal text /
+🙈 Hide text" toggle for anyone still learning the sūrah, plus a one-line
+hint while hidden. ListenRepeat/Review pass nothing → unchanged (they still
+show text to read from; ListenRepeat's Blind stage has its own separate
+hide). Verified the three visual states (all-transparent start → per-word
+green/red reveal → plain-ink peek) in an isolated HTML harness screenshot
+since Practice itself is behind the auth gate.
+
+typecheck + production build clean; app shell loads with no console errors
+(confirms the shared-module edits to tiers/GradedSurah didn't break the
+screens that also import them). Live Practice drive still needs a signed-in
+account (schema.sql + signup) like the rest of the auth-gated flows.
+
+PHASE 6 follow-up #12 — drop the reveal toggle; add a length-scaled audio clue
+-------------------------------------------------------------------------------
+User: "don't give the option to reveal text — if he wants to read he can go
+to the Read page. And create a system of clues based on the length of the
+āyah: it reads you a part of the [āyah] you achieved." Also confirmed the
+percentage should stay AS-IS (graded 34/67/100 — "let it as you made it";
+yes, 34%-on-first-pass is intentional to reward review, and they're keeping
+that), so memorizedRatio is unchanged.
+
+Removed from Practice: the `showText` state, the 👁/🙈 Reveal-text toggle, and
+the peek path. Recite-now is now ALWAYS recite-from-memory (GradedSurah
+hideUngraded hard-coded true); a small "Read the text →" link to /read/:surah
+replaces the toggle, matching the user's own suggested flow.
+
+New clue system (Practice): a "💡 Clue — hear the start of āyah N" button that
+plays the OPENING of the āyah you're currently on (highlightAyah — the next
+un-cleared āyah), via its own private <audio> (not the shared PlayerContext,
+so a clue never fights the mini-player), auto-stopping after a length-scaled
+slice. "Based on the length" = fraction clamp(CLUE_WORDS/wordCount, 0.15,
+0.5): a short āyah (≤4 words) hears up to half, Āyat al-Kursī (~50 words)
+only its first ~15% — always "a part," never the whole thing. Stops on
+re-tap, sūrah change, and unmount. Falls back to a message if the reciter's
+audio isn't on file / the audio server is down.
+
+Verified LIVE (happened to be signed in on the running dev server, so drove
+the real screen this time, not just a harness): on /practice?surah=1 all 7
+of Al-Fātiḥa's word-runs computed-style color = transparent (recite from
+memory), āyah markers still visible, clue button present reading "hear the
+start of āyah 1", reveal toggle absent, "Read the text →" + Memorized bar
+present. typecheck + production build clean; clue length-scaling proven with
+a standalone math check.
+
+Clue PLAYBACK now verified live too (2026-07-11): the user hit the clue and
+saw "Couldn't play the clue — is the audio server running?" — diagnosed as
+the port-8080 audio file server simply not running (curl → 000; it silences
+ALL app audio, not just the clue — mini-player, Listen & Repeat too). Started
+`python -m http.server 8080` at the repo root, then drove the live clue on
+/practice?surah=1: network showed GET .../alafasy/001001.mp3 → 200, no error,
+button auto-reverted after the short slice. Working as designed. NOTE for the
+user: that local audio server must be running for any playback; the durable
+fix is still hosting the audio on Cloudflare R2 (set VITE_AUDIO_BASE_URL to
+it) so playback doesn't depend on a local process.
+
+PHASE 6 follow-up #13 — clue reworked: audio → visual next-āyah reveal
+-------------------------------------------------------------------------------
+User insight: "it's not needed the clues because if you say it wrong it will
+show the word" → then "fix the clue to show the next aya." Right call — in
+recite-from-memory the CURRENT āyah's words already appear as you say them, so
+an audio clue for it was redundant AND depended on the port-8080 audio server
+(which had just bitten them). The real gap is blanking on how the NEXT āyah
+STARTS. So the clue is now a VISUAL reveal of the next āyah's opening, no audio.
+
+Removed from Practice: the whole audio-clue machinery (private <audio>,
+timers, cluePlaying/clueError, useAudio/useSettings/audioUrl imports).
+New: `nextAyah` = first āyah not yet passed; `hint = {ayah, words}`; button
+"💡 Clue — reveal the start of āyah N" → "💡 Show one more word" on repeat
+taps (progressive, +1 word/tap, so it scales to how stuck you are). Cleared
+when that āyah gets recited (nextAyah advances) or the sūrah changes.
+
+GradedSurah gained `hintChars?: Record<ayah, number>` and a proper per-char
+render MODE (graded | plain | hint | hidden) instead of the old binary
+graded/transparent: a "hint" char renders soft gold (#C9A227 @0.7 opacity) —
+distinct from green(correct)/red(wrong) so it reads as "here's how it starts,"
+not "you said this." firstWordsCharLen() in Practice maps the word-count hint
+to a leading-character count for the āyah.
+
+Verified LIVE on /practice?surah=1 (signed in): button read "reveal the start
+of āyah 1"; one tap → "بِسْمِ" shows in gold @0.7 opacity, other 7 word-runs
+stay transparent, button → "Show one more word"; second tap → "بِسْمِ ٱللَّهِ"
+revealed. Confirmed clean after a hard reload (Practice mounts with no
+ErrorBoundary fallback — the mid-edit "useSettings/cluePlaying is not defined"
+console errors were transient Vite HMR intermediates, gone on the final
+build; typecheck + production build both green).
+
+PHASE 6 follow-up #14 — sūrah-complete celebration (walk to mosque + tier + ring)
+-------------------------------------------------------------------------------
+User: the bare "Well done" banner "is not enough" — wants, on a correct full
+recitation: (1) a loading animation of a person walking to the mosque, (2) a
+popup keyed to first-time / memorizing / mastered, (3) the % graph animating
+up (e.g. 0 → 34%).
+
+New components/CompletionCelebration.tsx — a full-screen overlay with two
+phases: "walking" (~2.2s) → "result". WalkScene is a pure-SVG figure (head,
+thobe torso, swinging legs + arm) that walks rightward to a mosque (dome,
+arched door, minaret, gold crescent) along a dashed path; animation via CSS
+keyframes added to index.css (sanad-walk-x / -bob / -leg-front|back /
+-arm-front, limbs pivoting at the hip/shoulder through transform-box:
+fill-box). The result phase shows a tier icon+message (🌱 First time / 📖
+Coming along / ⭐ Mastered) and a conic-gradient ring whose % counts up from
+`fromPct` to `toPct` via requestAnimationFrame (ease-out cubic), with an
+"↑ 0% → 34%" delta line. Respects prefers-reduced-motion (skips the walk,
+snaps the ring — the global `* {animation:none}` rule pins the figure's end
+pose).
+
+Practice.tsx wiring: snapshots `baselinePct` (memorized % when the reciter
+ARRIVED, captured once memorization data loads) so the ring animates from the
+real starting value; `celebrationTier` = mastered if new %≥100, else "first"
+if baseline was 0, else "memorizing"; a celebratedRef-guarded effect opens the
+overlay once when surahComplete first flips true; onNext → next sūrah, onClose
+→ dismiss. All of it resets on sūrah change.
+
+Verified: typecheck + production build clean; the real /practice screen mounts
+fine (Start button present, no ErrorBoundary fallback) with the overlay
+correctly hidden until completion; the celebration visuals (walking figure
+mid-stride toward the mosque + "First time through!" popup with the 34% ring
+and "↑ 0% → 34%") confirmed via an isolated HTML harness screenshot (the live
+overlay only triggers on a real mic-driven completion, which the sandbox
+can't perform). Note: the console tool showed STALE buffered "cluePlaying is
+not defined" errors from an earlier mid-edit HMR version (timestamp
+t=1783789627588) — not reproducible on the current build (typecheck would
+fail on an undefined name; live mount succeeds).
+
+PHASE 6 follow-up #15 — signup name, richer Settings, first-run guide, āyah picker
+-------------------------------------------------------------------------------
+User asked for three things: (1) collect more info at login + a better Settings
+page, (2) a first-run app guide (pick ≥1 sūrah → land on it → popup explaining
+Recite-now vs Listen & Repeat), (3) let Listen & Repeat choose which āyah to
+continue from.
+
+1. Auth/name: AuthContext.signUp now takes an optional `name` → stored in
+   user_metadata.full_name; added `displayName` (metadata name, else the
+   email's local part) and `updateName`. Login shows a "Your name" field in
+   signup mode (verified live: labels = Your name / Email / Password). Journey
+   header greets "Assalāmu ʿalaykum, {name}".
+2. Settings: new Profile group (avatar initial + name + email, inline "Edit"
+   name via updateName), Account group keeps change-email + sign out, new Help
+   group ("Replay the app guide" → resetOnboarding()+navigate("/"), Tajweed
+   legend link).
+3. First-run guide: lib/onboarding.ts (localStorage `sanad.onboarded`,
+   fail-open). components/OnboardingOverlay.tsx — full-screen picker: greeting,
+   "good places to start" chips (Fātiḥa, the Quls, short sūrahs, Mulk/Yā-Sīn),
+   search over all 114, multi-select list; "Start" claims a slate slot per
+   pick and navigates to /surah/{first}?welcome=1. Mounted in Journey, gated on
+   !hasOnboarded(). SurahDetail reads ?welcome=1 → a coach popup explaining
+   🎧 Listen & Repeat (learn fresh, choose the starting āyah) vs 🎙 Recite now
+   (already know some → recite from memory).
+4. ListenRepeat: added a "Start from āyah:" <select> (all āyahs, ✓ marks
+   mastered ones) shown in the Listen stage; changing it calls goToChunk() —
+   the learner picks where to begin/continue instead of always auto-first-
+   unmastered.
+
+Verified: typecheck + production build clean; Login name field live; the
+OnboardingOverlay layout confirmed via an isolated render against the real
+compiled CSS (emerald header, suggested chips, sūrah rows, pill "Start"
+button). The onboarding/coach/Settings/āyah-picker screens sit behind
+RequireAuth and this browser context wasn't signed in, so they were verified
+by typecheck+build + isolated render rather than a live drive (same
+mandatory-account gate noted in earlier follow-ups).
+
+===============================================================================
+OPEN DECISIONS (revisit when you get to that phase, don't block on them now)
+===============================================================================
+- Phase 0's CER threshold — VALIDATED against real audio 2026-07-06 (not just
+  synthetic text), do not re-tune without re-running this evidence:
+    correct 1:1 (husary)     cer=0.000   correct 2:255 (long)   cer=0.120
+    correct 18:10 (medium)   cer=0.468   correct 112:1 (short)  cer=0.633
+    correct 114:1 (short)    cer=0.667
+    wrong  1:1 audio→2:255 text (long, distinct)     cer=0.918  CAUGHT
+    wrong  2:255 audio→1:1 text (long audio, short)  cer=8.74   CAUGHT
+    wrong  1:1 audio→1:2 text (adjacent, same surah) cer=0.765  CAUGHT (barely)
+    wrong  1:1 audio→112:1 text (both short)         cer=0.433  MISSED
+    wrong  112:1 audio→1:1 text (both short, reverse) cer=0.737  MISSED (barely)
+  Reading: medium/long ayahs are caught reliably in both directions (comfortable
+  margin above 0.75 for wrong, comfortable margin below for correct). SHORT
+  ayahs (roughly <15 letters — most of surahs 105-114, opening ayahs) are the
+  weak spot, and it's NOT a threshold problem: correct short recitations
+  ALREADY sit at 0.63-0.67 CER (just the raw non-Quran-tuned ASR's noise floor
+  on so little text), right up against wrong-short-ayah cases at 0.43-0.74.
+  There is no threshold value that separates these two clusters — LOWERING it
+  to catch the missed wrong-ayah cases WOULD flag correct 112:1/114:1 as
+  mismatched (false rejection of a correct reciter). Conclusion: leave
+  CONTENT_MISMATCH_CER at 0.75 (safe default, protects the correct-short-ayah
+  cases); short-ayah wrong-content detection needs Phase 1's WORD-level
+  comparison (a wrong short ayah recited word-by-word should mismatch on
+  individual words even when the whole-text ratio is ambiguous) — don't
+  attempt to fix this in Phase 0 by threshold tuning alone, it's provably
+  not solvable that way with this data.
+- Phase 3 naming/whether it's a new screen or a mode toggle on Practice.
+- RESOLVED (PHASE 6 follow-up #6): real Supabase Auth accounts exist now
+  (state/AuthContext.tsx, screens/Login.tsx), OPTIONAL not gating.
+  Memorization/streak/active-slate still stay local (localStorage) — an
+  account does not yet sync them cross-device. That's the next open question
+  if it's ever wanted: migrate useMemorization/useStreak/useActiveSlate's
+  localStorage reads/writes to Supabase tables keyed by auth.uid() when
+  signed in, falling back to localStorage when signed out. Don't build this
+  speculatively — wait until it's actually requested.
+- Whether to eventually train a dedicated tajweed-mistake classifier (the
+  user's "train an AI model" option) — DEFER this; it needs labeled mistake
+  data we don't have yet, and Phases 0-2 (decode + duration + nasality,
+  all already-proven techniques) should cover most real feedback needs
+  first. Revisit only if the ASR-based approach's error rate proves
+  insufficient in practice.
+
+===============================================================================
+SUGGESTED BUILD ORDER
+===============================================================================
+1. Phase 0 (content-sanity check) — small, unlocks trust, do first.
+2. Phase 1 (word-level scoring) — the core architecture upgrade.
+3. Phase 3 (drills screen) — can run in parallel with Phase 2, reuses Phase
+   0/1's grading call on a smaller scale, high user-visible value for
+   relatively low new-ML risk.
+4. Phase 2 (whole-surah flow) — mostly orchestration once Phase 1 exists.
+5. Phase 4 (memorization tracker) — independent, can slot in anywhere, no
+   ML dependency.
+6. Phase 5 (SRS) — needs Phase 4's table; benefits from but doesn't strictly
+   require Phase 1.

@@ -1,0 +1,77 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  @apply bg-brand-cream text-brand-ink antialiased dark:bg-brand-dark dark:text-brand-darkInk;
+  margin: 0;
+}
+
+/* Qur'an text rendering: RTL, large, generous line-height. */
+.quran {
+  @apply font-quran leading-[2.4] tracking-normal;
+  direction: rtl;
+  text-align: right;
+  font-feature-settings: "kern" 1;
+}
+
+/* A tappable Tajweed-colored run inside the verse text. */
+.tajweed-seg {
+  cursor: pointer;
+  border-radius: 2px;
+  transition: background-color 120ms ease;
+}
+.tajweed-seg:hover {
+  background-color: rgba(201, 162, 39, 0.12);
+}
+
+/* --- "Walking to the mosque" completion animation (CompletionCelebration) --- */
+@keyframes sanad-walk-x {
+  from { transform: translateX(0); }
+  to { transform: translateX(180px); }
+}
+@keyframes sanad-bob {
+  0%, 100% { transform: translateY(0); }
+  25%, 75% { transform: translateY(-3px); }
+}
+@keyframes sanad-leg-front {
+  0%, 100% { transform: rotate(24deg); }
+  50% { transform: rotate(-24deg); }
+}
+@keyframes sanad-leg-back {
+  0%, 100% { transform: rotate(-24deg); }
+  50% { transform: rotate(24deg); }
+}
+@keyframes sanad-arm-front {
+  0%, 100% { transform: rotate(-20deg); }
+  50% { transform: rotate(20deg); }
+}
+.sanad-walker { animation: sanad-walk-x 2s ease-in-out forwards; }
+.sanad-bob { animation: sanad-bob 0.5s ease-in-out infinite; }
+/* Leg/arm swings pivot at the hip/shoulder (top of each limb line). */
+.sanad-leg-front,
+.sanad-leg-back,
+.sanad-arm-front {
+  transform-box: fill-box;
+  transform-origin: top center;
+}
+.sanad-leg-front { animation: sanad-leg-front 0.5s ease-in-out infinite; }
+.sanad-leg-back { animation: sanad-leg-back 0.5s ease-in-out infinite; }
+.sanad-arm-front { animation: sanad-arm-front 0.5s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation: none !important;
+    transition: none !important;
+  }
+}

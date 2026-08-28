@@ -1,0 +1,17 @@
+{
+  "name": "Sanad — Qur'an Tajweed Reader",
+  "short_name": "Sanad",
+  "description": "Learn, recite and memorize the Qur'an with color-coded Tajweed, AI recitation correction, and spaced-repetition review.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F7F3EA",
+  "theme_color": "#0E5A4A",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

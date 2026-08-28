@@ -1,0 +1,31 @@
+{
+  "generated_at": "2026-06-29T17:51:37Z",
+  "audio_root": "Data/audio/ayahs",
+  "params": {
+    "layers": [
+      "inventory"
+    ],
+    "surah": 1,
+    "sample": null,
+    "min_bytes": 1024,
+    "workers": 8,
+    "mad_k": 6.0,
+    "min_abs_s": 0.4
+  },
+  "canonical_ayahs": 7,
+  "reciters": {
+    "alafasy": {
+      "inventory": {
+        "present": 7,
+        "missing_count": 0,
+        "extra_count": 0,
+        "duplicate_count": 0,
+        "unparsed_count": 0,
+        "missing": [],
+        "extra": [],
+        "duplicates": [],
+        "unparsed": []
+      }
+    }
+  }
+}

@@ -1,0 +1,29 @@
+# Secrets — ne jamais committer
+.env
+.env.*
+!.env.example.txt
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Données volumineuses & artefacts
+Data/audio/
+Data/.cache/
+Data/processed/dead_letter*.jsonl
+output/
+
+# Artefacts de développement (ajouté avant la mise sous git)
+.build_tmp/
+.hf/
+.hf_cache/
+.claude/settings.local.json
+
+# Gros artefacts générés (résultats légers conservés volontairement)
+Data/processed/audio_map.json
+Data/processed/calib_checkpoint.jsonl
+Data/processed/audio_verify_report_full.json
+Data/processed/audio_repair_worklist.tsv

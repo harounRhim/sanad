@@ -1,0 +1,14 @@
+{
+  "surah": 112,
+  "ayah": 1,
+  "audio_path": "Data\\audio\\ayahs\\alafasy\\112001.mp3",
+  "duration_s": 2.98,
+  "haraka_unit_s": 0.02,
+  "aligner": "wav2vec2:jonatasgrosman/wav2vec2-large-xlsr-53-arabic",
+  "summary": {
+    "ok": 0,
+    "warn": 0,
+    "total": 0
+  },
+  "results": []
+}

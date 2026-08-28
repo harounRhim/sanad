@@ -1,0 +1,29 @@
+# Cœur de l'extraction (streaming JSON sans saturer la RAM)
+ijson>=3.2
+
+# Étape Supabase (loader + ingestion)
+supabase>=2.0
+python-dotenv>=1.0
+
+# Barre de progression (optionnelle : ingest.py dégrade proprement si absente)
+tqdm>=4.66
+
+# Vérification audio (lecture d'en-têtes MP3 sans ffmpeg : durée/bitrate)
+mutagen>=1.47
+
+# Tests (dev)
+pytest>=8.0
+
+# --- Moteur de correction Tajweed (Phase 4, OPTIONNEL) -----------------------
+# Le cœur (tajweed.correction) s'importe sans ces paquets ; seul l'aligneur réel
+# wav2vec2 les requiert. Installer à la demande (CPU) :
+#   pip install torch torchaudio transformers soundfile
+# torch>=2.1
+# torchaudio>=2.1
+# transformers>=4.40
+# soundfile>=0.12
+
+# --- API de correction (server/app.py) ---------------------------------------
+fastapi>=0.110
+uvicorn>=0.29
+python-multipart>=0.0.9
