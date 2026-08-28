@@ -27,3 +27,6 @@ Data/processed/audio_map.json
 Data/processed/calib_checkpoint.jsonl
 Data/processed/audio_verify_report_full.json
 Data/processed/audio_repair_worklist.tsv
+
+# Document strategique prive (conserve en local, hors depot)
+docs/PLAN_VENTE_SANAD.md
