@@ -97,7 +97,7 @@ def _render_verse(word_scores, plain_text):
             "font-family:serif'>" + " ".join(parts) + "</div>")
 
 
-@spaces.GPU(duration=120)
+@spaces.GPU(duration=45)
 def _run_engine(audio_path, s, a):
     aligner = _get_aligner()
     device = "cuda" if torch.cuda.is_available() else "cpu"
